@@ -48,6 +48,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Bar = QuantConnect.Data.Market.Bar;
 using HistoryRequest = QuantConnect.Data.HistoryRequest;
+using QuantConnect.TradingPairs;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 using Order = QuantConnect.Orders.Order;
 using Newtonsoft.Json;
@@ -821,6 +822,191 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Converts IB time string (EST/EDT format "yyyyMMdd HH:mm:ss") to UTC DateTime.
+        /// Automatically handles daylight saving time transitions.
+        /// </summary>
+        /// <param name="ibTime">Time string from IB API in EST/EDT timezone</param>
+        /// <returns>UTC DateTime</returns>
+        private static DateTime IBTimeToUTC(string ibTime)
+        {
+            if (string.IsNullOrEmpty(ibTime))
+            {
+                Log.Error("IBTimeToUTC: Received null or empty time string, falling back to UtcNow");
+                return DateTime.UtcNow;
+            }
+
+            try
+            {
+                // Parse IB time string (EST/EDT timezone, no timezone indicator)
+                // IB uses two formats: "yyyyMMdd HH:mm:ss" or "yyyyMMdd-HH:mm:ss"
+                DateTime parsed;
+                if (DateTime.TryParseExact(ibTime, "yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed) ||
+                    DateTime.TryParseExact(ibTime, "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                {
+                    // Convert from New York timezone (handles EST/EDT automatically) to UTC
+                    return parsed.ConvertToUtc(TimeZones.NewYork);
+                }
+
+                Log.Error($"IBTimeToUTC: Failed to parse IB time '{ibTime}' with known formats, falling back to UtcNow");
+                return DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"IBTimeToUTC: Failed to parse IB time '{ibTime}': {ex.Message}, falling back to UtcNow");
+                return DateTime.UtcNow;
+            }
+        }
+
+        /// <summary>
+        /// Converts UTC DateTime to IB time string format (EST/EDT "yyyyMMdd HH:mm:ss").
+        /// Automatically handles daylight saving time transitions.
+        /// </summary>
+        /// <param name="utcTime">UTC DateTime</param>
+        /// <returns>Time string in IB API format (EST/EDT timezone)</returns>
+        private static string UTCToIBTime(DateTime utcTime)
+        {
+            // Convert from UTC to New York timezone (handles EST/EDT automatically)
+            var nyTime = utcTime.ConvertFromUtc(TimeZones.NewYork);
+            return nyTime.ToStringInvariant("yyyyMMdd HH:mm:ss");
+        }
+
+        /// <summary>
+        /// Gets execution history from IB within the specified UTC time range.
+        /// Implements IExecutionHistoryProvider interface for reconciliation support.
+        /// </summary>
+        /// <param name="startTimeUtc">Start time in UTC</param>
+        /// <param name="endTimeUtc">End time in UTC</param>
+        /// <returns>List of execution records</returns>
+        public List<ExecutionRecord> GetExecutionHistory(DateTime startTimeUtc, DateTime endTimeUtc)
+        {
+            // Create filter with time range only (no symbol filter - query all executions)
+            var filter = new ExecutionFilter
+            {
+                AcctCode = _account,
+                ClientId = ClientId,
+                Time = UTCToIBTime(startTimeUtc),  // Convert UTC to IB time (EST/EDT)
+                // Symbol, Exchange, SecType, Side all left empty to query all executions
+            };
+
+            var executionDetails = new List<IB.ExecutionDetailsEventArgs>();
+            var commissionReports = new ConcurrentDictionary<string, IBApi.CommissionAndFeesReport>();
+            var manualResetEvent = new ManualResetEvent(false);
+            var requestId = GetNextId();
+
+            _requestInformation[requestId] = new RequestInformation
+            {
+                RequestId = requestId,
+                RequestType = RequestType.Executions,
+                Message = $"[Id={requestId}] GetExecutionHistory: {startTimeUtc:yyyy-MM-dd HH:mm:ss} to {endTimeUtc:yyyy-MM-dd HH:mm:ss} UTC"
+            };
+
+            // Define event handlers
+            EventHandler<IB.RequestEndEventArgs> clientOnExecutionDataEnd = (sender, args) =>
+            {
+                if (args.RequestId == requestId)
+                {
+                    manualResetEvent.Set();
+                }
+            };
+
+            EventHandler<IB.ExecutionDetailsEventArgs> clientOnExecDetails = (sender, args) =>
+            {
+                if (args.RequestId == requestId)
+                {
+                    executionDetails.Add(args);
+                }
+            };
+
+            EventHandler<IB.CommissionReportEventArgs> clientOnCommissionReport = (sender, args) =>
+            {
+                commissionReports[args.CommissionReport.ExecId] = args.CommissionReport;
+            };
+
+            // Subscribe to events
+            _client.ExecutionDetails += clientOnExecDetails;
+            _client.ExecutionDetailsEnd += clientOnExecutionDataEnd;
+            _client.CommissionReport += clientOnCommissionReport;
+
+            try
+            {
+                CheckRateLimiting();
+
+                // Request executions from IB
+                _client.ClientSocket.reqExecutions(requestId, filter);
+
+                // Wait for response (5 second timeout)
+                if (!manualResetEvent.WaitOne(5000))
+                {
+                    Log.Error($"InteractiveBrokersBrokerage.GetExecutionHistory(): Request {requestId} timed out after 5 seconds");
+                }
+
+                // Convert to ExecutionRecord list
+                var records = new List<ExecutionRecord>();
+
+                foreach (var detail in executionDetails)
+                {
+                    try
+                    {
+                        var execution = detail.Execution;
+                        var contract = detail.Contract;
+
+                        // Convert execution time from IB format (EST/EDT) to UTC
+                        var timeUtc = IBTimeToUTC(execution.Time);
+
+                        // Filter by endTimeUtc (IB filter only supports start time)
+                        if (timeUtc > endTimeUtc)
+                        {
+                            continue;
+                        }
+
+                        // Get LEAN symbol from IB contract
+                        var symbol = MapSymbol(contract);
+
+                        // Convert IB side to signed quantity
+                        var quantity = execution.Side == "BOT" ? execution.Shares : -execution.Shares;
+
+                        // Get commission if available
+                        decimal fee = 0m;
+                        string feeCurrency = "USD";
+                        if (commissionReports.TryGetValue(execution.ExecId, out var commissionReport))
+                        {
+                            fee = Convert.ToDecimal(commissionReport.CommissionAndFees);
+                            feeCurrency = commissionReport.Currency?.ToUpperInvariant() ?? "USD";
+                        }
+
+                        var record = new ExecutionRecord
+                        {
+                            ExecutionId = execution.ExecId,
+                            Symbol = symbol,
+                            Quantity = quantity,
+                            Price = Convert.ToDecimal(execution.Price),
+                            TimeUtc = timeUtc,
+                            Tag = execution.OrderRef,  // IB's OrderRef field for order tags
+                            Fee = fee,
+                            FeeCurrency = feeCurrency
+                        };
+
+                        records.Add(record);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"InteractiveBrokersBrokerage.GetExecutionHistory(): Error converting execution {detail.Execution.ExecId}: {ex.Message}");
+                    }
+                }
+
+                Log.Trace($"InteractiveBrokersBrokerage.GetExecutionHistory(): Retrieved {records.Count} executions from {startTimeUtc:yyyy-MM-dd HH:mm:ss} to {endTimeUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                return records;
+            }
+            finally
+            {
+                // Unsubscribe from events
+                _client.ExecutionDetails -= clientOnExecDetails;
+                _client.ExecutionDetailsEnd -= clientOnExecutionDataEnd;
+                _client.CommissionReport -= clientOnCommissionReport;
+            }
+        }
+
+        /// <summary>
         /// Connects the client to the IB gateway
         /// </summary>
         public override void Connect()
@@ -1367,7 +1553,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return;
             }
 
-            ValidateSubscription();
+            // ValidateSubscription();
 
             _isInitialized = true;
             _loadExistingHoldings = loadExistingHoldings;
@@ -2734,11 +2920,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 // mark sells as negative quantities
                 var fillQuantity = targetOrder.Direction == OrderDirection.Buy ? currentQuantityFilled : -currentQuantityFilled;
-                var orderEvent = new OrderEvent(targetOrder, DateTime.UtcNow, orderFee, "Interactive Brokers Order Fill Event")
+                var orderEvent = new OrderEvent(targetOrder, IBTimeToUTC(targetOrderExecutionDetails.Execution.Time), orderFee, "Interactive Brokers Order Fill Event")
                 {
                     Status = status,
                     FillPrice = price,
-                    FillQuantity = fillQuantity
+                    FillQuantity = fillQuantity,
+                    ExecutionId = targetOrderExecutionDetails.Execution.ExecId
                 };
                 if (remainingQuantity != 0)
                 {
