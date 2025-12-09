@@ -764,6 +764,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Gets the execution details matching the filter
         /// </summary>
+        /// <param name="timeSince">Optional start time filter in UTC. If null, no time filter is applied (all executions).</param>
         /// <returns>A list of executions matching the filter</returns>
         public List<IB.ExecutionDetailsEventArgs> GetExecutions(string symbol, string type, string exchange, DateTime? timeSince, string side)
         {
@@ -774,7 +775,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Exchange = exchange,
                 SecType = type ?? IB.SecurityType.Undefined,
                 Symbol = symbol,
-                Time = (timeSince ?? DateTime.MinValue).ToStringInvariant("yyyyMMdd HH:mm:ss"),
+                // Convert UTC to IB API time format (UTC with hyphen separator) to avoid warning 2174
+                Time = timeSince.HasValue ? UTCToIBTime(timeSince.Value) : string.Empty,
                 Side = side ?? IB.ActionSide.Undefined
             };
 
@@ -822,10 +824,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Converts IB time string (EST/EDT format "yyyyMMdd HH:mm:ss") to UTC DateTime.
+        /// Converts IB time string to UTC DateTime.
+        /// Supports multiple formats: "yyyyMMdd HH:mm:ss", "yyyyMMdd-HH:mm:ss", "yyyyMMdd HH:mm:ss US/Eastern"
         /// Automatically handles daylight saving time transitions.
         /// </summary>
-        /// <param name="ibTime">Time string from IB API in EST/EDT timezone</param>
+        /// <param name="ibTime">Time string from IB API</param>
         /// <returns>UTC DateTime</returns>
         private static DateTime IBTimeToUTC(string ibTime)
         {
@@ -837,14 +840,49 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             try
             {
-                // Parse IB time string (EST/EDT timezone, no timezone indicator)
-                // IB uses two formats: "yyyyMMdd HH:mm:ss" or "yyyyMMdd-HH:mm:ss"
-                DateTime parsed;
-                if (DateTime.TryParseExact(ibTime, "yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed) ||
-                    DateTime.TryParseExact(ibTime, "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                // Check if time string contains timezone suffix (format: "yyyyMMdd HH:mm:ss TZ")
+                // IB API may return timezones like: US/Eastern, US/Pacific, US/Central, GMT, etc.
+                var timeString = ibTime.Trim();
+                DateTimeZone timezone = TimeZones.NewYork; // Default to NY timezone for backward compatibility
+
+                // Extract timezone if present (last part after space)
+                var parts = timeString.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 3)
                 {
-                    // Convert from New York timezone (handles EST/EDT automatically) to UTC
-                    return parsed.ConvertToUtc(TimeZones.NewYork);
+                    var timezoneId = parts[2]; // e.g., "US/Eastern"
+                    timeString = $"{parts[0]} {parts[1]}"; // e.g., "20251209 02:25:57"
+
+                    // Map IB timezone to LEAN timezone
+                    switch (timezoneId)
+                    {
+                        case "US/Eastern":
+                            timezone = TimeZones.NewYork;
+                            break;
+                        case "US/Pacific":
+                            timezone = TimeZones.LosAngeles;
+                            break;
+                        case "US/Central":
+                            timezone = TimeZones.Chicago;
+                            break;
+                        case "GMT":
+                        case "UTC":
+                            timezone = TimeZones.Utc;
+                            break;
+                        default:
+                            Log.Trace($"IBTimeToUTC: Unknown timezone '{timezoneId}', defaulting to US/Eastern");
+                            timezone = TimeZones.NewYork;
+                            break;
+                    }
+                }
+
+                // Parse IB time string
+                // IB uses multiple formats: "yyyyMMdd HH:mm:ss" or "yyyyMMdd-HH:mm:ss"
+                DateTime parsed;
+                if (DateTime.TryParseExact(timeString, "yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed) ||
+                    DateTime.TryParseExact(timeString, "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+                {
+                    // Convert from specified timezone to UTC
+                    return parsed.ConvertToUtc(timezone);
                 }
 
                 Log.Error($"IBTimeToUTC: Failed to parse IB time '{ibTime}' with known formats, falling back to UtcNow");
@@ -858,16 +896,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Converts UTC DateTime to IB time string format (EST/EDT "yyyyMMdd HH:mm:ss").
-        /// Automatically handles daylight saving time transitions.
+        /// Converts UTC DateTime to IB API time format in UTC.
+        /// Uses hyphen-separated format to explicitly indicate UTC timezone.
         /// </summary>
         /// <param name="utcTime">UTC DateTime</param>
-        /// <returns>Time string in IB API format (EST/EDT timezone)</returns>
+        /// <returns>Time string in IB API UTC format (e.g., "20251208-15:30:00")</returns>
         private static string UTCToIBTime(DateTime utcTime)
         {
-            // Convert from UTC to New York timezone (handles EST/EDT automatically)
-            var nyTime = utcTime.ConvertFromUtc(TimeZones.NewYork);
-            return nyTime.ToStringInvariant("yyyyMMdd HH:mm:ss");
+            // IB API accepts UTC format with hyphen separator: "yyyyMMdd-HH:mm:ss"
+            // The hyphen between date and time explicitly indicates UTC timezone
+            // This prevents warning 2174 about implicit timezone functionality being deprecated
+            return utcTime.ToStringInvariant("yyyyMMdd-HH:mm:ss");
         }
 
         /// <summary>
@@ -884,7 +923,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 AcctCode = _account,
                 ClientId = ClientId,
-                Time = UTCToIBTime(startTimeUtc),  // Convert UTC to IB time (EST/EDT)
+                Time = UTCToIBTime(startTimeUtc),  // Convert UTC to IB API time format (UTC with hyphen)
                 // Symbol, Exchange, SecType, Side all left empty to query all executions
             };
 
@@ -2661,6 +2700,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
+                // Skip historical query responses - those are handled by GetExecutionHistory's own callback
+                // GetExecutionHistory should be a pure read-only query without side effects
+                if (_requestInformation.TryGetValue(executionDetails.RequestId, out var requestInfo) &&
+                    requestInfo.RequestType == RequestType.Executions)
+                {
+                    // This is a response to a GetExecutionHistory query, not a real-time execution
+                    // Let the query's own handler process it
+                    return;
+                }
+
                 // There are not guaranteed to be orderStatus callbacks for every change in order status. For example with market orders when the order is accepted and executes immediately,
                 // there commonly will not be any corresponding orderStatus callbacks. For that reason it is recommended to monitor the IBApi.EWrapper.execDetails function in addition to
                 // IBApi.EWrapper.orderStatus. From IB API docs
@@ -2742,6 +2791,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     // save commission in dictionary and wait for execution event
                     _commissionReports[e.CommissionReport.ExecId] = e.CommissionReport;
+                    return;
+                }
+
+                // Skip historical query responses - those are handled by GetExecutionHistory's own callback
+                // CommissionReport doesn't have RequestId, but we can check the associated ExecutionDetails
+                if (_requestInformation.TryGetValue(executionDetails.RequestId, out var requestInfo) &&
+                    requestInfo.RequestType == RequestType.Executions)
+                {
+                    // Historical query - don't emit order fill for historical data
                     return;
                 }
 

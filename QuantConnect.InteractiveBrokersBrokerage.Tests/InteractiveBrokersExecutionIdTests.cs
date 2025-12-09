@@ -15,6 +15,7 @@
 
 using NUnit.Framework;
 using QuantConnect.Algorithm;
+using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
@@ -287,6 +288,50 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             if (executions.Count > 0)
             {
                 Log.Trace("✅ All execution times are within UTC query range");
+            }
+        }
+
+        /// <summary>
+        /// Tests that GetExecutionHistory does not produce timezone warning (Error 2174)
+        /// Verifies that datetime format includes explicit timezone as required by IB API
+        /// </summary>
+        [Test]
+        [Explicit("Requires live IB Paper Trading connection")]
+        public void GetExecutionHistory_ShouldNotProduceTimezoneWarning()
+        {
+            // Arrange - Track brokerage messages to check for warning 2174
+            var warnings = new List<string>();
+            EventHandler<BrokerageMessageEvent> messageHandler = (sender, e) =>
+            {
+                if (e.Type == BrokerageMessageType.Information && e.Message.Contains("2174"))
+                {
+                    warnings.Add(e.Message);
+                    Log.Trace($"⚠️ Captured timezone warning: {e.Message}");
+                }
+            };
+
+            _brokerage.Message += messageHandler;
+
+            try
+            {
+                // Act - Query execution history (should trigger the API call)
+                var endTime = DateTime.UtcNow;
+                var startTime = endTime.AddMinutes(-30);
+
+                Log.Trace($"Querying execution history: {startTime:yyyy-MM-dd HH:mm:ss} to {endTime:yyyy-MM-dd HH:mm:ss} UTC");
+                var executions = _brokerage.GetExecutionHistory(startTime, endTime);
+
+                Thread.Sleep(1000); // Give time for any warnings to arrive
+
+                // Assert - Should not have received warning 2174
+                Assert.IsEmpty(warnings,
+                    $"Expected no timezone warnings, but received {warnings.Count} warning(s): {string.Join("; ", warnings)}");
+
+                Log.Trace("✅ No timezone warning (2174) received - datetime format is correct");
+            }
+            finally
+            {
+                _brokerage.Message -= messageHandler;
             }
         }
 
