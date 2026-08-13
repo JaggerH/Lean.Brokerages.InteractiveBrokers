@@ -109,6 +109,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
         private const int ClientId = 0;
 
+        // How long GetExecutionHistory waits for IB's execDetailsEnd before giving up. Exceeding it
+        // throws - see the comment at the wait itself for why silence must not become an empty list.
+        internal static TimeSpan ExecutionHistoryTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
         // daily restart is at 23:45 local host time
         private static TimeSpan _heartBeatTimeLimit = new(23, 0, 0);
 
@@ -973,10 +977,25 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // Request executions from IB
                 _client.ClientSocket.reqExecutions(requestId, filter);
 
-                // Wait for response (5 second timeout)
-                if (!manualResetEvent.WaitOne(5000))
+                // Wait for response. A timeout MUST throw, never fall through to return whatever
+                // arrived so far: every caller of this method reads an empty list as the positive
+                // answer "nothing filled in that window", and each of them acts on it destructively.
+                //   - ReconcilableBrokerageTransactionHandler.Reconcile advances CheckPointTime to
+                //     now on an empty result, so the fills we failed to fetch fall outside every
+                //     future query window - permanently unaccounted, not retried.
+                //   - TradingPairManager.RestoreState replays the downtime window exactly once.
+                //   - CompositeBrokerage.TryGetVenueExecutionHistory backs the venue-recovery gate,
+                //     which unblocks a degraded venue's legs on "asked, nothing filled".
+                // All three already handle a thrown exception correctly (checkpoint stays put, the
+                // gate stays closed), so throwing is what turns "could not tell" back into itself.
+                if (!manualResetEvent.WaitOne(ExecutionHistoryTimeout))
                 {
-                    Log.Error($"InteractiveBrokersBrokerage.GetExecutionHistory(): Request {requestId} timed out after 5 seconds");
+                    throw new TimeoutException(
+                        $"InteractiveBrokersBrokerage.GetExecutionHistory(): request {requestId} timed out after " +
+                        $"{ExecutionHistoryTimeout.TotalSeconds:0.#}s waiting for execDetailsEnd " +
+                        $"({startTimeUtc:yyyy-MM-dd HH:mm:ss} to {endTimeUtc:yyyy-MM-dd HH:mm:ss} UTC). " +
+                        $"{executionDetails.Count} execution(s) had arrived; returning them would be " +
+                        "indistinguishable from a complete answer.");
                 }
 
                 // Convert to ExecutionRecord list
