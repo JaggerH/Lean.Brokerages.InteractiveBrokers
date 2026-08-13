@@ -395,5 +395,37 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 _brokerage.OrdersStatusChanged -= cancelHandler;
             }
         }
+
+        /// <summary>
+        /// A timed-out execution-history request must throw, never return the partial list.
+        /// </summary>
+        /// <remarks>
+        /// Every caller reads an empty list as the positive answer "nothing filled in that window".
+        /// ReconcilableBrokerageTransactionHandler.Reconcile then advances its checkpoint past the
+        /// window, so the fills we failed to fetch are never queried again; the composite venue
+        /// recovery gate unblocks a degraded venue's legs on the same reading. An exception is the
+        /// only way to say "could not tell" - all three callers already handle it correctly.
+        /// </remarks>
+        [Test]
+        [Explicit("Requires live IB Paper Trading connection")]
+        public void GetExecutionHistory_TimingOutThrowsRatherThanReturningAnEmptyList()
+        {
+            var original = InteractiveBrokersBrokerage.ExecutionHistoryTimeout;
+            // Short enough that execDetailsEnd cannot possibly arrive first, so the wait always
+            // loses the race - this is the timeout branch, not a slow-network flake.
+            InteractiveBrokersBrokerage.ExecutionHistoryTimeout = TimeSpan.FromMilliseconds(1);
+
+            try
+            {
+                Assert.Throws<TimeoutException>(
+                    () => _brokerage.GetExecutionHistory(DateTime.UtcNow.AddHours(-1), DateTime.UtcNow),
+                    "A timed-out request returned instead of throwing - callers cannot tell that " +
+                    "answer apart from 'nothing filled'.");
+            }
+            finally
+            {
+                InteractiveBrokersBrokerage.ExecutionHistoryTimeout = original;
+            }
+        }
     }
 }
