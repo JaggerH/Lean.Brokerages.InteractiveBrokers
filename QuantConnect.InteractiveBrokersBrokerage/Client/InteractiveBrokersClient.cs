@@ -101,6 +101,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler OpenOrderEnd;
 
         /// <summary>
+        /// CompletedOrder event handler. Fed by <c>reqCompletedOrders</c>, which is the only IB
+        /// request that reports today's already finished orders — <c>reqAllOpenOrders</c> drops them
+        /// the moment they stop resting and <c>reqExecutions</c> never sees the ones that were
+        /// cancelled without a fill.
+        /// </summary>
+        public event EventHandler<CompletedOrderEventArgs> CompletedOrder;
+
+        /// <summary>
+        /// CompletedOrdersEnd event handler
+        /// </summary>
+        public event EventHandler CompletedOrdersEnd;
+
+        /// <summary>
         /// ContractDetails event handler
         /// </summary>
         public event EventHandler<ContractDetailsEventArgs> ContractDetails;
@@ -508,6 +521,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
+        /// Feeds in completed orders in response to reqCompletedOrders(). Same three payload objects
+        /// as <see cref="openOrder"/> minus the order id argument — the id lives on
+        /// <c>order.OrderId</c>, and IB leaves it 0 for orders it did not place in this session, in
+        /// which case <c>order.PermId</c> is the only durable identifier.
+        /// </summary>
+        /// <param name="contract">The contract the order was placed for.</param>
+        /// <param name="order">The order, including its OrderRef.</param>
+        /// <param name="orderState">Status and commission fields; <c>orderState.Status</c> carries the completed status.</param>
+        public override void completedOrder(Contract contract, Order order, OrderState orderState)
+        {
+            OnCompletedOrder(new CompletedOrderEventArgs(contract, order, orderState));
+        }
+
+        /// <summary>
+        /// This is called at the end of a given request for completed orders.
+        /// </summary>
+        public override void completedOrdersEnd()
+        {
+            OnCompletedOrdersEnd();
+        }
+
+        /// <summary>
         /// Returns all contracts matching the requested parameters in reqContractDetails(). For example, you can receive an entire option chain.
         /// </summary>
         /// <param name="reqId">The ID of the data request. Ensures that responses are matched to requests if several requests are in process.</param>
@@ -766,6 +801,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         protected virtual void OnOpenOrderEnd()
         {
             OpenOrderEnd?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// CompletedOrder event invocator
+        /// </summary>
+        protected virtual void OnCompletedOrder(CompletedOrderEventArgs e)
+        {
+            CompletedOrder?.Invoke(this, e);
+        }
+
+        /// <summary>
+        /// CompletedOrdersEnd event invocator
+        /// </summary>
+        protected virtual void OnCompletedOrdersEnd()
+        {
+            CompletedOrdersEnd?.Invoke(this, EventArgs.Empty);
         }
 
         /// <summary>
