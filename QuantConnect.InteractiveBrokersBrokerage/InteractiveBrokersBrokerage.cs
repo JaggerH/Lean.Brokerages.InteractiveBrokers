@@ -3378,6 +3378,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 result.Add(leanOrder);
             }
 
+            // OrderRef carries the client order id we stamped at submission. Restart recovery
+            // (OrderLedgerRecovery) matches adopted orders to the ledger by Order.Tag, and the
+            // constructors above never saw the original tag — without this backfill, intents
+            // from the pre-ack crash window can never be matched and alarm on every startup.
+            foreach (var leanOrderResult in result)
+            {
+                leanOrderResult.TryBackfillBrokerageTag(ibOrder.OrderRef);
+            }
+
             return result;
         }
 
