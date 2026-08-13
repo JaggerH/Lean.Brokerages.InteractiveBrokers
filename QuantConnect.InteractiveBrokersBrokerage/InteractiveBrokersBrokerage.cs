@@ -66,7 +66,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     /// The Interactive Brokers brokerage
     /// </summary>
     [BrokerageFactory(typeof(InteractiveBrokersBrokerageFactory))]
-    public sealed class InteractiveBrokersBrokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider
+    public sealed partial class InteractiveBrokersBrokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider
     {
         /// <summary>
         /// The name of the brokerage.
@@ -1821,8 +1821,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 else
                 {
+                    // Write-ahead: the ledger intent is handed to the OS before placeOrder goes out,
+                    // so a crash between here and IB's acknowledgement still leaves the key on disk.
+                    // A throw from here aborts the placement, which is the intended contract.
+                    var orderRef = ResolveOrderRef(orders, ibOrderId, needsNewId);
+
                     _pendingOrderResponse[ibOrderId] = orderSubmittedEvent = new ManualResetEventSlim(false);
-                    var ibOrder = ConvertOrder(orders, contract, ibOrderId);
+                    var ibOrder = ConvertOrder(orders, contract, ibOrderId, orderRef);
                     _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
                 }
             }
@@ -2333,6 +2338,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
+            // Ledger tombstone. Deliberately outside the InvalidatingCodes branch: that set answers
+            // "should Lean mark the order Invalid", which is a different question from "is it proven
+            // that IB never took the order" — 104 "Can't modify a filled order" invalidates and yet
+            // proves the order exists. See ConfirmedRejectionCodes for the codes and the reasoning.
+            TryRecordLedgerDead(requestId, errorCode, errorMsg);
+
             if (InvalidatingCodes.Contains(errorCode))
             {
                 // let's unblock the waiting thread right away
@@ -2474,6 +2485,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return;
                 }
 
+                // Ledger bookkeeping goes before the Lean-order lookup and before the early returns
+                // further down: it is keyed off the IB order id alone and must not depend on this
+                // run having a matching Lean order.
+                RecordLedgerAck(update.OrderId, null);
+                var status = ConvertOrderStatus(update.Status);
+                if (status == OrderStatus.Filled || status == OrderStatus.Canceled)
+                {
+                    // IB's own terminal verdict - the only thing this brokerage treats as proof the
+                    // order is finished. Closing the entry is what lets the ledger be compacted.
+                    RecordLedgerClosed(update.OrderId);
+                }
+
                 if (!TryGetLeanOrder(update.OrderId, nameof(HandleOrderStatusUpdates), out var orders))
                 {
                     return;
@@ -2484,8 +2507,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     _preSubmittedStopLimitOrders.TryAdd(firstOrder.Id, stopLimitOrder);
                 }
-
-                var status = ConvertOrderStatus(update.Status);
 
                 // Let's remove the contract for combo orders when they are canceled or filled
                 if (firstOrder.GroupOrderManager != null && (status == OrderStatus.Filled || status == OrderStatus.Canceled))
@@ -2577,6 +2598,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // before we call get open orders which might not be fully initialized/loaded
                     return;
                 }
+
+                // Before any of the early returns below: this callback is IB's proof that it holds
+                // the order, and it is the one callback that echoes OrderRef back, so it is also the
+                // only ack path that works for an order left over from a previous run.
+                RecordLedgerAck(e.Order.OrderId, e.Order.OrderRef);
 
                 if (!TryGetLeanOrder(e.Order.OrderId, nameof(HandleOpenOrder), out var orders, e.Order.FaGroup))
                 {
@@ -3081,7 +3107,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Converts a QC order to an IB order
         /// </summary>
-        private IBApi.Order ConvertOrder(List<Order> orders, Contract contract, int ibOrderId)
+        /// <param name="orderRef">The order ledger key to carry on the order, or null when this run
+        /// has no ledger. IB's OrderRef is the field a client order id belongs in: it is echoed back
+        /// on openOrder and on every execution report.</param>
+        private IBApi.Order ConvertOrder(List<Order> orders, Contract contract, int ibOrderId, string orderRef = null)
         {
             OrderDirection direction;
             decimal quantity;
@@ -3124,7 +3153,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Tif = ConvertTimeInForce(order),
                 Transmit = true,
                 Rule80A = _agentDescription,
-                OutsideRth = outsideRth
+                OutsideRth = outsideRth,
+                // The order ledger key. string.Empty (IB's own default for unset string fields, see
+                // "Use an empty string if not applicable" in their docs) when this run has no ledger.
+                OrderRef = orderRef ?? string.Empty
             };
 
             var gtdTimeInForce = order.TimeInForce as GoodTilDateTimeInForce;
