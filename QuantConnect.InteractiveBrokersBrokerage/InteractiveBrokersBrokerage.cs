@@ -2384,6 +2384,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 else
                 {
+                    // The error carries no contract, so the symbol comes from the order request that
+                    // filed this id. Without it every located order gets invalidated, which on a
+                    // shared order provider can mark an unrelated live order Invalid.
+                    orders = FilterOrdersByLeanSymbol(orders, GetOrderRequestSymbol(requestId), requestId, "HandleError.InvalidateOrder");
+
                     OnOrderEvents(orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
                     {
                         Status = OrderStatus.Invalid,
@@ -2518,7 +2523,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     RecordLedgerClosed(update.OrderId);
                 }
 
-                if (!TryGetLeanOrder(update.OrderId, nameof(HandleOrderStatusUpdates), out var orders))
+                // IB's order status callback carries no contract, so the only symbol available here is
+                // the one we recorded when we sent the order. It is absent for an order adopted from a
+                // previous run, in which case the lookup stays unfiltered.
+                if (!TryGetLeanOrder(update.OrderId, nameof(HandleOrderStatusUpdates), out var orders,
+                    leanSymbol: GetOrderRequestSymbol(update.OrderId)))
                 {
                     return;
                 }
@@ -2625,7 +2634,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // only ack path that works for an order left over from a previous run.
                 RecordLedgerAck(e.Order.OrderId, e.Order.OrderRef);
 
-                if (!TryGetLeanOrder(e.Order.OrderId, nameof(HandleOpenOrder), out var orders, e.Order.FaGroup))
+                if (!TryGetLeanOrder(e.Order.OrderId, nameof(HandleOpenOrder), out var orders, e.Order.FaGroup,
+                    TryMapContractSymbol(e.Contract, nameof(HandleOpenOrder)) ?? GetOrderRequestSymbol(e.Order.OrderId)))
                 {
                     return;
                 }
@@ -2687,7 +2697,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="leanOrders">The list of Lean orders associated with the brokerage ID, if found.</param>
         /// <param name="faGroup">Optional FA group associated with the order.</param>
         /// <returns><c>true</c> if the order is valid and found; otherwise, <c>false</c>.</returns>
-        private bool TryGetLeanOrder(int brokerageOrderId, string caller, out List<Order> leanOrders, string faGroup = default)
+        private bool TryGetLeanOrder(int brokerageOrderId, string caller, out List<Order> leanOrders, string faGroup = default,
+            Symbol leanSymbol = null)
         {
             leanOrders = default;
 
@@ -2704,7 +2715,112 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return false;
             }
 
+            leanOrders = FilterOrdersByLeanSymbol(leanOrders, leanSymbol, brokerageOrderId, caller);
             return true;
+        }
+
+        /// <summary>
+        /// Narrows a bare-brokerage-id lookup down to the orders belonging to <paramref name="leanSymbol"/>.
+        /// </summary>
+        /// <remarks>
+        /// The lookup key is an IB order id, which says nothing about the instrument. Once this
+        /// brokerage runs next to other venues in the same order provider - or across a restart that
+        /// re-uses ids - a single id can answer with orders on several symbols, and taking the first
+        /// one attributes an inbound report to the wrong order. The symbol the report itself carries
+        /// is the only independent evidence available to break that tie.
+        ///
+        /// The three outcomes are all deliberate, and none of them is silent:
+        /// - no candidate matches: the report and our order book disagree about what this id is. We
+        ///   keep the unfiltered list, because dropping the report would lose an order event for
+        ///   certain, while the pre-existing first-match behaviour is only possibly wrong. Logged as
+        ///   an error since one of the two sides is broken.
+        /// - exactly one matches: the answer this method exists to produce.
+        /// - several match: same symbol, same id, several Lean orders - the symbol cannot separate
+        ///   them (combo legs on one instrument look like this). Returns all of them, leaving the
+        ///   caller's existing multi-order handling in charge, and logs the ids so the ambiguity is
+        ///   visible rather than resolved by luck.
+        ///
+        /// A single candidate is returned unchecked: with nothing to disambiguate, rejecting it on a
+        /// symbol mismatch could only turn a possible misattribution into a certain lost report.
+        /// </remarks>
+        internal static List<Order> FilterOrdersByLeanSymbol(List<Order> orders, Symbol leanSymbol, int brokerageOrderId, string caller)
+        {
+            if (leanSymbol == null || orders == null || orders.Count <= 1)
+            {
+                return orders;
+            }
+
+            var matches = orders.Where(order => order != null && order.Symbol == leanSymbol).ToList();
+            if (matches.Count == 0)
+            {
+                Log.Error($"InteractiveBrokersBrokerage.{caller}(): BrokerageID {brokerageOrderId} reported for symbol {leanSymbol.ID} " +
+                    $"but the located orders are for {string.Join(", ", orders.Where(order => order != null).Select(order => order.Symbol.ID))}. " +
+                    "Proceeding without symbol filtering.");
+                return orders;
+            }
+
+            if (matches.Count > 1)
+            {
+                Log.Error($"InteractiveBrokersBrokerage.{caller}(): BrokerageID {brokerageOrderId} matches {matches.Count} Lean orders " +
+                    $"on symbol {leanSymbol.ID}: {string.Join(", ", matches.Select(order => order.Id))}. The symbol cannot disambiguate them.");
+            }
+
+            return matches;
+        }
+
+        /// <summary>
+        /// Maps an inbound IB contract to a Lean symbol for the sole purpose of disambiguating an
+        /// order lookup, answering null instead of throwing when it cannot be mapped.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="MapSymbol"/> throws for anything it cannot represent - an unknown ticker, a
+        /// future option with no matching underlying. That is the right answer when the mapped symbol
+        /// IS the result; here it is only a filter, so a failure must degrade to "do not filter"
+        /// rather than discard the whole report.
+        ///
+        /// A combo (BAG) contract is skipped before mapping: its legs are several symbols under one
+        /// order id, so no single symbol could correctly narrow the lookup.
+        /// </remarks>
+        private Symbol TryMapContractSymbol(Contract contract, string caller)
+        {
+            if (contract == null || contract.SecType == IB.SecurityType.Bag)
+            {
+                return null;
+            }
+
+            try
+            {
+                return MapSymbol(contract);
+            }
+            catch (Exception err)
+            {
+                Log.Trace($"InteractiveBrokersBrokerage.{caller}(): could not map contract {contract.Symbol} to a Lean symbol, " +
+                    $"order lookup will not be filtered by symbol. {err.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// The Lean symbol this brokerage last associated with the given IB order id, or null when
+        /// the id is not known to belong to an order we sent.
+        /// </summary>
+        /// <remarks>
+        /// The request table is keyed by a request id namespace shared with market data, contract
+        /// and history requests, so an entry only says something about an order when it was filed by
+        /// an order request. Anything else - including an order adopted from a previous run, which
+        /// has no entry at all - answers null, and the caller keeps its unfiltered behaviour.
+        /// </remarks>
+        private Symbol GetOrderRequestSymbol(int brokerageOrderId)
+        {
+            if (_requestInformation.TryGetValue(brokerageOrderId, out var requestInfo) &&
+                (requestInfo.RequestType == RequestType.PlaceOrder ||
+                 requestInfo.RequestType == RequestType.UpdateOrder ||
+                 requestInfo.RequestType == RequestType.CancelOrder))
+            {
+                return requestInfo.AssociatedSymbol;
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -2881,6 +2997,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             var mappedSymbol = MapSymbol(executionDetails.Contract);
             var orders = _orderProvider.GetOrdersByBrokerageId(executionDetails.Execution.OrderId);
+            // Already symbol-filtered, unlike the other inbound lookups. Two behaviours to know about:
+            // a lone candidate is taken without checking its symbol (same reasoning as
+            // FilterOrdersByLeanSymbol), and several candidates on the SAME symbol make
+            // SingleOrDefault throw, which the caller's catch turns into a logged error and a dropped
+            // fill - loud, but it does drop the fill rather than pick a leg at random.
             var order = orders.Count == 1
                 ? orders[0]
                 : orders.SingleOrDefault(o => o.Symbol == mappedSymbol);
