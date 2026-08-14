@@ -1002,6 +1002,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 // Convert to ExecutionRecord list
                 var records = new List<ExecutionRecord>();
+                var skippedForeign = new List<string>();
 
                 foreach (var detail in executionDetails)
                 {
@@ -1050,8 +1051,35 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     catch (Exception ex)
                     {
+                        // A record that fails conversion splits two ways, and the split is what keeps
+                        // this method honest (see ExecutionBelongsToInstruments for the judgement):
+                        // - an instrument this algorithm trades: the caller reconciles and settles
+                        //   windows on this answer, and a list quietly missing one of OUR fills is
+                        //   indistinguishable from a complete one. Fail the whole query instead —
+                        //   Reconcile() treats the throw as "window not settled" and re-asks.
+                        // - anything else (legacy stock, fund, manual trade on an unmapped asset): a
+                        //   permanent throw here would keep the reconcile loop down for as long as the
+                        //   account holds the asset. Skip it, but through OnMessage, not just a log.
+                        if (ExecutionBelongsToAlgorithmInstrument(detail.Contract))
+                        {
+                            throw new InvalidOperationException(
+                                $"GetExecutionHistory request {requestId}: execution {detail.Execution.ExecId} " +
+                                $"(IB ticker {detail.Contract?.Symbol}) failed to convert and belongs to an instrument " +
+                                "this algorithm trades. Returning the remaining records would be indistinguishable " +
+                                "from a complete answer, so the whole query fails and the reconciliation window " +
+                                "stays open.", ex);
+                        }
+
+                        skippedForeign.Add($"{detail.Execution.ExecId} ({detail.Contract?.Symbol} {detail.Contract?.SecType}): {ex.Message}");
                         Log.Error($"InteractiveBrokersBrokerage.GetExecutionHistory(): Error converting execution {detail.Execution.ExecId}: {ex.Message}");
                     }
+                }
+
+                if (skippedForeign.Count > 0)
+                {
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "EXECUTION_HISTORY_SKIPPED",
+                        $"GetExecutionHistory skipped {skippedForeign.Count} execution(s) on instruments this algorithm " +
+                        $"does not trade: {string.Join("; ", skippedForeign)}"));
                 }
 
                 Log.Trace($"InteractiveBrokersBrokerage.GetExecutionHistory(): Retrieved {records.Count} executions from {startTimeUtc:yyyy-MM-dd HH:mm:ss} to {endTimeUtc:yyyy-MM-dd HH:mm:ss} UTC");
@@ -1064,6 +1092,80 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _client.ExecutionDetailsEnd -= clientOnExecutionDataEnd;
                 _client.CommissionReport -= clientOnCommissionReport;
             }
+        }
+
+        /// <summary>
+        /// Whether an execution's contract belongs to an instrument this algorithm trades — the
+        /// judgement that decides if a conversion failure in <see cref="GetExecutionHistory"/> fails
+        /// the whole query (our instrument: a silently short answer would settle reconciliation
+        /// windows over a missing fill) or is skipped with a count (a foreign asset in the account:
+        /// throwing would keep the reconcile loop permanently down for an instrument we never trade).
+        /// </summary>
+        private bool ExecutionBelongsToAlgorithmInstrument(Contract contract)
+        {
+            var securities = _algorithm?.Securities;
+            if (securities == null || securities.Count == 0)
+            {
+                return false;
+            }
+
+            return ExecutionBelongsToInstruments(
+                contract,
+                securities.Keys.ToList(),
+                c =>
+                {
+                    try { return MapSymbol(c); }
+                    catch { return null; }
+                },
+                s =>
+                {
+                    try { return _symbolMapper?.GetBrokerageSymbol(s); }
+                    catch { return null; }
+                });
+        }
+
+        /// <summary>
+        /// Pure core of <see cref="ExecutionBelongsToAlgorithmInstrument"/>, split out so the
+        /// judgement is unit-testable without an IB Gateway.
+        ///
+        /// Two directions, because the very record being judged is one that failed to convert:
+        /// - inbound first: if the contract still maps to a Lean symbol (the conversion failed on
+        ///   something else — time format, fee decimal), membership of the instrument set answers
+        ///   directly.
+        /// - inbound failed: the contract cannot be compared in Lean terms at all, so each of the
+        ///   algorithm's instruments is mapped OUTBOUND to its IB ticker and compared against the
+        ///   contract's raw ticker. A mapper that throws on some instrument answers null for that
+        ///   instrument and the comparison moves on — the judgement itself must never throw.
+        /// </summary>
+        internal static bool ExecutionBelongsToInstruments(Contract contract, IReadOnlyCollection<Symbol> instruments,
+            Func<Contract, Symbol> tryMapInbound, Func<Symbol, string> tryMapOutbound)
+        {
+            if (contract == null || instruments == null || instruments.Count == 0)
+            {
+                return false;
+            }
+
+            var leanSymbol = tryMapInbound?.Invoke(contract);
+            if (leanSymbol != null)
+            {
+                return instruments.Contains(leanSymbol);
+            }
+
+            if (tryMapOutbound == null)
+            {
+                return false;
+            }
+
+            foreach (var instrument in instruments)
+            {
+                var ibTicker = tryMapOutbound(instrument);
+                if (ibTicker != null && string.Equals(ibTicker, contract.Symbol, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
