@@ -4326,6 +4326,27 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Maps the IB Contract's symbol to a QC symbol
         /// </summary>
+        /// <summary>
+        /// Resolves the LEAN market an inbound IB contract belongs to.
+        /// </summary>
+        /// <remarks>
+        /// The default market map answers per security type only, so every inbound equity used to come
+        /// back as a USA equity. An order sent for a non-USA listing would then be reported back under a
+        /// different Symbol than the one it was placed with, and the order ledger would never match its
+        /// own fills. Equities are therefore keyed off the contract currency, which IB populates on both
+        /// contract details and execution reports.
+        /// </remarks>
+        internal static string GetContractMarket(Contract contract, SecurityType securityType)
+        {
+            if (securityType == SecurityType.Equity &&
+                string.Equals(contract.Currency, Currencies.KRW, StringComparison.InvariantCultureIgnoreCase))
+            {
+                return Market.KRX;
+            }
+
+            return InteractiveBrokersBrokerageModel.DefaultMarketMap[securityType];
+        }
+
         private Symbol MapSymbol(Contract contract)
         {
             try
@@ -4351,7 +4372,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                 }
 
-                var market = InteractiveBrokersBrokerageModel.DefaultMarketMap[securityType];
+                var market = GetContractMarket(contract, securityType);
                 var isFutureOption = contract.SecType == IB.SecurityType.FutureOption;
 
                 if (securityType.IsOption() && contract.LastTradeDateOrContractMonth == "0")
@@ -4724,7 +4745,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // Include future options as a special case with no matching market, otherwise
             // our subscriptions are removed without any sort of notice.
             return
-                (securityType == SecurityType.Equity && market == Market.USA) ||
+                (securityType == SecurityType.Equity && (market == Market.USA || market == Market.KRX)) ||
                 (securityType == SecurityType.Forex && market == Market.Oanda) ||
                 (securityType == SecurityType.Option && market == Market.USA) ||
                 (securityType == SecurityType.IndexOption && market == Market.USA) ||
