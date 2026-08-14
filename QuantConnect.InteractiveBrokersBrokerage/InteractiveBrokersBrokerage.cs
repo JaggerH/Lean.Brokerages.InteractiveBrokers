@@ -4324,9 +4324,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Maps the IB Contract's symbol to a QC symbol
-        /// </summary>
-        /// <summary>
         /// Resolves the LEAN market an inbound IB contract belongs to.
         /// </summary>
         /// <remarks>
@@ -4347,6 +4344,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return InteractiveBrokersBrokerageModel.DefaultMarketMap[securityType];
         }
 
+        /// <summary>
+        /// Maps the IB Contract's symbol to a QC symbol
+        /// </summary>
         private Symbol MapSymbol(Contract contract)
         {
             try
