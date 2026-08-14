@@ -14,25 +14,132 @@
 */
 
 using System;
+using System.Collections.Generic;
 using NUnit.Framework;
+using QuantConnect.Brokerages;
 using QuantConnect.Brokerages.InteractiveBrokers;
+using QuantConnect.Interfaces;
+using QuantConnect.Orders;
 using QuantConnect.Orders.Ledger;
 
 namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 {
     /// <summary>
-    /// Locks the two judgement surfaces of the IB order-ledger wiring that can be exercised without
-    /// an IB Gateway: the OrderRef constraint, and the table deciding which error codes are allowed
-    /// to write a ledger tombstone.
-    ///
-    /// NOT covered here, and deliberately called out rather than faked: that the key actually lands
-    /// on the outbound IBApi.Order. Every path to <c>ConvertOrder</c> goes through the brokerage
-    /// constructor, which starts IBAutomater and an IB Gateway process, so it cannot be reached from
-    /// a unit test in this repository.
+    /// Locks the judgement surfaces of the IB order-ledger wiring that can be exercised without an
+    /// IB Gateway: the OrderRef constraint, the table deciding which error codes may write a ledger
+    /// tombstone, and — via the parameterless (Composer) constructor, which never starts
+    /// IBAutomater — the outbound placement chain itself: the key <c>ResolveOrderRef</c> registers
+    /// is the key <c>ConvertOrder</c> stamps on the outbound <c>IBApi.Order.OrderRef</c>.
     /// </summary>
     [TestFixture]
     public class InteractiveBrokersOrderLedgerTests
     {
+        /// <summary>
+        /// Records RegisterIntent calls and answers TryResolve with "unknown" — enough ledger for
+        /// the placement chain, which only registers and maps keys.
+        /// </summary>
+        private sealed class RecordingLedger : IOrderLedger
+        {
+            public readonly List<Order> RegisteredOrders = new List<Order>();
+
+            public string RegisterIntent(Order order, string venue, OrderKeyConstraint constraint)
+            {
+                RegisteredOrders.Add(order);
+                var key = OrderKeyGenerator.Build(order.Id, RegisteredOrders.Count);
+                constraint.Validate(key, venue);
+                return key;
+            }
+
+            public bool RecordAck(string clientOrderId, string exchangeOrderId) => true;
+            public bool RecordClosed(string clientOrderId) => true;
+            public bool RecordDead(string clientOrderId, string reason) => true;
+            public bool TryResolve(string venue, string exchangeOrderId, string clientOrderId, out LedgerEntry entry)
+            {
+                entry = null;
+                return false;
+            }
+            public bool Rebind(string clientOrderId, int newLeanOrderId) => true;
+            public void Compact(DateTime beforeUtc) { }
+            public void SyncToDisk() { }
+            public string RunId => "test-run";
+            public IReadOnlyList<LedgerEntry> OpenIntents => new List<LedgerEntry>();
+            public void Dispose() { }
+        }
+
+        private static MarketOrder NewOrder()
+        {
+            // Order.Id stays 0: its setter is internal to QuantConnect.Common and the id plays no
+            // part in what these tests lock.
+            return new MarketOrder(Symbol.Create("SPY", SecurityType.Equity, Market.USA), 100m, new DateTime(2026, 8, 14));
+        }
+
+        [Test]
+        public void PlacementChainStampsTheRegisteredKeyOnTheOutboundOrder()
+        {
+            var brokerage = new InteractiveBrokersBrokerage();
+            var ledger = new RecordingLedger();
+            brokerage.WireOrderLedgerForTesting(ledger);
+            var orders = new List<Order> { NewOrder() };
+
+            var key = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true);
+            var ibOrder = brokerage.ConvertOrder(orders, new IBApi.Contract(), ibOrderId: 1, orderRef: key);
+
+            // The whole point of the ledger: the key we registered is the key IB will echo back.
+            Assert.IsNotNull(key);
+            Assert.AreEqual(key, ibOrder.OrderRef);
+            Assert.AreEqual(1, ledger.RegisteredOrders.Count);
+        }
+
+        [Test]
+        public void ModificationReusesThePlacementKeyInsteadOfMintingASecondOne()
+        {
+            var brokerage = new InteractiveBrokersBrokerage();
+            var ledger = new RecordingLedger();
+            brokerage.WireOrderLedgerForTesting(ledger);
+            var orders = new List<Order> { NewOrder() };
+
+            var placementKey = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true);
+            var modificationKey = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: false);
+
+            // A second key would open a second ledger entry that nothing ever acks.
+            Assert.AreEqual(placementKey, modificationKey);
+            Assert.AreEqual(1, ledger.RegisteredOrders.Count);
+        }
+
+        [Test]
+        public void NoLedgerMeansEmptyOrderRefNotNull()
+        {
+            var brokerage = new InteractiveBrokersBrokerage();
+            var orders = new List<Order> { NewOrder() };
+
+            var key = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true);
+            var ibOrder = brokerage.ConvertOrder(orders, new IBApi.Contract(), ibOrderId: 1, orderRef: key);
+
+            // IB's own convention for unset string fields is the empty string.
+            Assert.IsNull(key);
+            Assert.AreEqual(string.Empty, ibOrder.OrderRef);
+        }
+
+        [Test]
+        public void ComboRegistrationWarnsThatOnlyTheFirstLegIsCovered()
+        {
+            var brokerage = new InteractiveBrokersBrokerage();
+            var ledger = new RecordingLedger();
+            brokerage.WireOrderLedgerForTesting(ledger);
+            var orders = new List<Order> { NewOrder(), NewOrder() };
+            var messages = new List<BrokerageMessageEvent>();
+            brokerage.Message += (_, e) => messages.Add(e);
+
+            var key = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true);
+
+            // One intent under the first leg is the designed shape; doing it silently is not.
+            Assert.IsNotNull(key);
+            Assert.AreEqual(1, ledger.RegisteredOrders.Count);
+            Assert.AreSame(orders[0], ledger.RegisteredOrders[0]);
+            Assert.AreEqual(1, messages.Count);
+            Assert.AreEqual("ORDER_LEDGER_COMBO_PARTIAL", messages[0].Code);
+        }
+
         [Test]
         public void OrderRefConstraintAcceptsAGeneratedLedgerKey()
         {

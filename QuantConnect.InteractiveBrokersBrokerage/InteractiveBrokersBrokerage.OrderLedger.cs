@@ -157,7 +157,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="ibOrderId">The IB order id this request will use.</param>
         /// <param name="needsNewId">True for a placement, false for a modification.</param>
         /// <returns>The key, or null when there is no ledger to register with.</returns>
-        private string ResolveOrderRef(List<Order> orders, int ibOrderId, bool needsNewId)
+        internal string ResolveOrderRef(List<Order> orders, int ibOrderId, bool needsNewId)
         {
             if (!needsNewId)
             {
@@ -180,6 +180,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return null;
             }
 
+            if (orders.Count > 1)
+            {
+                // IB gives the whole combo one order id and one OrderRef, so the ledger holds one
+                // intent under orders[0] and cannot account for the other legs individually. Placing
+                // the combo is fine; relying on the ledger for its per-leg accounting is not — and
+                // silence here would look exactly like full coverage.
+                var message = $"combo order (lean order {orders[0].Id} + {orders.Count - 1} more legs): the " +
+                    "order ledger registers one intent for the whole combo under the first leg; the remaining " +
+                    "legs share its key and are NOT individually reconciled. Per-leg ledger accounting for " +
+                    "combo orders is not implemented — see docs/TODO.md before relying on it.";
+                Log.Error($"InteractiveBrokersBrokerage.ResolveOrderRef(): {message}");
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "ORDER_LEDGER_COMBO_PARTIAL", message));
+            }
+
             // Symbol.ID.Market, not a hardcoded constant and not the brokerage name: IB trades
             // usa/cme/nymex/oanda/... and the ledger's venue comparison is ordinal and
             // case-sensitive, so a wrong label does not throw — it just makes every later lookup
@@ -192,6 +206,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var key = ledger.RegisterIntent(orders[0], venue, OrderRefConstraint);
             _ledgerKeysByIbOrderId[ibOrderId] = key;
             return key;
+        }
+
+        /// <summary>
+        /// Test seam: wires a ledger directly, bypassing the <see cref="_algorithm"/>-based
+        /// resolution — reaching that path requires the full constructor, which starts an IB
+        /// Gateway. Production wiring goes through the <see cref="Ledger"/> getter only.
+        /// </summary>
+        internal void WireOrderLedgerForTesting(IOrderLedger ledger)
+        {
+            _ledger = ledger;
+            _ledgerResolved = true;
         }
 
         /// <summary>

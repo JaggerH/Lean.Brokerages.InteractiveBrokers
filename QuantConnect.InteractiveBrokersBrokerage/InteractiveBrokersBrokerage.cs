@@ -309,7 +309,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns>True if the account is a master account</returns>
         public static bool IsMasterAccount(string account)
         {
-            return account.Contains("F");
+            // null happens on an uninitialized instance (Composer's parameterless construction,
+            // unit tests): no account means no FA master account.
+            return account != null && account.Contains("F");
         }
 
         /// <summary>
@@ -3129,7 +3131,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="orderRef">The order ledger key to carry on the order, or null when this run
         /// has no ledger. IB's OrderRef is the field a client order id belongs in: it is echoed back
         /// on openOrder and on every execution report.</param>
-        private IBApi.Order ConvertOrder(List<Order> orders, Contract contract, int ibOrderId, string orderRef = null)
+        // internal (not private) so the ledger tests can lock "the key actually lands on the
+        // outbound IBApi.Order" without an IB Gateway — see InteractiveBrokersOrderLedgerTests.
+        internal IBApi.Order ConvertOrder(List<Order> orders, Contract contract, int ibOrderId, string orderRef = null)
         {
             OrderDirection direction;
             decimal quantity;
