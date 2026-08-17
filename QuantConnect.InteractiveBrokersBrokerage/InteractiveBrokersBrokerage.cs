@@ -66,7 +66,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     /// The Interactive Brokers brokerage
     /// </summary>
     [BrokerageFactory(typeof(InteractiveBrokersBrokerageFactory))]
-    public sealed partial class InteractiveBrokersBrokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider
+    public sealed partial class InteractiveBrokersBrokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider,
+        IExecutionHistoryProvider
     {
         /// <summary>
         /// The name of the brokerage.
@@ -1093,6 +1094,35 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _client.CommissionReport -= clientOnCommissionReport;
             }
         }
+
+        /// <summary>
+        /// What a "no fills" answer from <see cref="GetExecutionHistory"/> covers. See
+        /// <see cref="IExecutionHistoryProvider.DescribeExecutionHistoryCoverage"/>.
+        /// </summary>
+        /// <remarks>
+        /// Two real blind spots, both stated rather than left to the interface's generic default:
+        ///
+        /// 1. THE FILTER IS SCOPED TO THIS API CLIENT. <see cref="GetExecutionHistory"/> sets
+        ///    <c>ExecutionFilter.ClientId</c> to this connection's client id, so a fill placed by
+        ///    hand in TWS, or by another process sharing the account under a different client id, is
+        ///    not in the answer. That is the right scope for reconciling OUR orders — an unrelated
+        ///    process's fills have no local order to reconcile against — but it means this method
+        ///    must never be read as "nothing happened on the account".
+        /// 2. IB KEEPS 24 HOURS OF EXECUTIONS. IB's own words on the <c>execDetails</c> callback:
+        ///    "Returns executions from the last 24 hours as a response to reqExecutions()". A window
+        ///    older than that comes back empty because the records aged out, not because nothing
+        ///    filled — see <see cref="ExecutionLookbackWindow"/>, which is the same bound the
+        ///    OrderRef query refuses to call NotFound past.
+        ///
+        /// Not mentioned here because it is announced on its own channel: an execution on an
+        /// instrument this algorithm does not trade that fails to convert is skipped, and that skip
+        /// goes out as an EXECUTION_HISTORY_SKIPPED brokerage message naming each one.
+        /// </remarks>
+        public string DescribeExecutionHistoryCoverage() =>
+            $"IB was asked for account {_account} filtered to this API client id ({ClientId}), so fills placed by " +
+            "hand in TWS or by another process on the same account are NOT in this answer. IB also only keeps " +
+            $"{ExecutionLookbackWindow.TotalHours}h of executions, so a window older than that reports no fills " +
+            "because the records aged out, not because nothing traded.";
 
         /// <summary>
         /// Whether an execution's contract belongs to an instrument this algorithm trades — the
