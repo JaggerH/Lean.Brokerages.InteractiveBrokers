@@ -3405,19 +3405,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 quantity = order.Quantity;
             }
 
-            var outsideRth = false;
             var orderProperties = order.Properties as InteractiveBrokersOrderProperties;
-            if (order.Type == OrderType.Limit ||
-                order.Type == OrderType.LimitIfTouched ||
-                order.Type == OrderType.StopMarket ||
-                order.Type == OrderType.StopLimit ||
-                order.Type == OrderType.TrailingStop)
-            {
-                if (orderProperties != null)
-                {
-                    outsideRth = orderProperties.OutsideRegularTradingHours;
-                }
-            }
+            var outsideRth = ResolveOutsideRth(order.Properties, order.Type);
 
             var ibOrder = new IBApi.Order
             {
@@ -4092,6 +4081,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Whether these order properties mark the order for IB's overnight session.
+        /// </summary>
+        /// <remarks>
+        /// The single source of truth for "is this an overnight order" - exchange routing, time-in-force
+        /// and the outside-RTH flag all derive from this same predicate so the three can never disagree.
+        /// </remarks>
+        internal static bool IsOvernightOrder(IOrderProperties properties)
+        {
+            return properties is ArbitrageOrderProperties { OvernightSession: true };
+        }
+
+        /// <summary>
         /// The exchange an order should be routed to for the overnight session, or the one already
         /// chosen when this order is not an overnight order.
         /// </summary>
@@ -4107,9 +4108,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return currentExchange;
             }
 
-            return properties is ArbitrageOrderProperties { OvernightSession: true }
-                ? "OVERNIGHT"
-                : null;
+            return IsOvernightOrder(properties) ? "OVERNIGHT" : null;
         }
 
         /// <summary>
@@ -4124,7 +4123,41 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </remarks>
         internal static string ResolveOvernightTimeInForce(IOrderProperties properties)
         {
-            return properties is ArbitrageOrderProperties { OvernightSession: true } ? "OVT" : null;
+            return IsOvernightOrder(properties) ? "OVT" : null;
+        }
+
+        /// <summary>
+        /// Whether OutsideRth should be set on the outbound IB order.
+        /// </summary>
+        /// <remarks>
+        /// An overnight order is by definition outside regular hours: it is routed to IB's overnight
+        /// venue and dies with the session. Deriving the flag from <see cref="IsOvernightOrder"/> rather
+        /// than trusting every caller to also set OutsideRegularTradingHours means the two can never
+        /// disagree - a mismatch would produce an order aimed at a venue it is not permitted to trade
+        /// on, which no test and no compiler would catch. For non-overnight orders, behaviour is
+        /// unchanged: the flag is read only for order types IB accepts it on.
+        /// </remarks>
+        internal static bool ResolveOutsideRth(IOrderProperties properties, OrderType orderType)
+        {
+            var outsideRth = false;
+            if (orderType == OrderType.Limit ||
+                orderType == OrderType.LimitIfTouched ||
+                orderType == OrderType.StopMarket ||
+                orderType == OrderType.StopLimit ||
+                orderType == OrderType.TrailingStop)
+            {
+                if (properties is InteractiveBrokersOrderProperties orderProperties)
+                {
+                    outsideRth = orderProperties.OutsideRegularTradingHours;
+                }
+            }
+
+            if (IsOvernightOrder(properties))
+            {
+                outsideRth = true;
+            }
+
+            return outsideRth;
         }
 
         /// <summary>

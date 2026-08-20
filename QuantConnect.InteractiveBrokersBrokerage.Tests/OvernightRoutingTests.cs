@@ -64,5 +64,40 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.IsNull(InteractiveBrokersBrokerage.ResolveOvernightTimeInForce(properties));
         }
+
+        [Test]
+        public void OvernightOrder_ForcesOutsideRth_EvenWhenCallerLeftFlagDefault()
+        {
+            // 调用方忘了同时设 OutsideRegularTradingHours 也不许送出 OutsideRth=false——
+            // 隔夜场本来就不在常规时段内，两者不许分道扬镳
+            var properties = new ArbitrageOrderProperties { OvernightSession = true, OutsideRegularTradingHours = false };
+
+            Assert.IsTrue(InteractiveBrokersBrokerage.ResolveOutsideRth(properties, OrderType.Limit));
+        }
+
+        [Test]
+        public void NonOvernightOrder_OutsideRthTrue_IsUnchanged()
+        {
+            var properties = new InteractiveBrokersOrderProperties { OutsideRegularTradingHours = true };
+
+            Assert.IsTrue(InteractiveBrokersBrokerage.ResolveOutsideRth(properties, OrderType.Limit));
+        }
+
+        [Test]
+        public void NonOvernightOrder_OutsideRthFalse_IsUnchanged()
+        {
+            var properties = new InteractiveBrokersOrderProperties { OutsideRegularTradingHours = false };
+
+            Assert.IsFalse(InteractiveBrokersBrokerage.ResolveOutsideRth(properties, OrderType.Limit));
+        }
+
+        [Test]
+        public void NonOvernightOrder_UnsupportedOrderType_IsAlwaysFalse()
+        {
+            // OutsideRth 只在 IB 认可它的那几种单类型上被读取；其余类型即便设了 flag 也不该生效
+            var properties = new InteractiveBrokersOrderProperties { OutsideRegularTradingHours = true };
+
+            Assert.IsFalse(InteractiveBrokersBrokerage.ResolveOutsideRth(properties, OrderType.Market));
+        }
     }
 }
