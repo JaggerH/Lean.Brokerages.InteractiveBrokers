@@ -1902,6 +1902,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 exchange = Market.CBOE.ToUpperInvariant();
             }
 
+            exchange = ResolveOvernightExchange(order.Properties, exchange);
+
             // If a combo order is being updated, let's use the existing contract to overcome IB's bug.
             // See https://github.com/QuantConnect/Lean.Brokerages.InteractiveBrokers/issues/66 and
             // https://groups.io/g/twsapi/topic/5333246?p=%2C%2C%2C20%2C0%2C0%2C0%3A%3A%2C%2C%2C0%2C0%2C0%2C5333246
@@ -3426,7 +3428,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 TotalQuantity = (int)Math.Abs(quantity),
                 OrderType = ConvertOrderType(order.Type),
                 AllOrNone = false,
-                Tif = ConvertTimeInForce(order),
+                Tif = ResolveOvernightTimeInForce(order.Properties) ?? ConvertTimeInForce(order),
                 Transmit = true,
                 Rule80A = _agentDescription,
                 OutsideRth = outsideRth,
@@ -4087,6 +4089,42 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             return DateTime.ParseExact(expiryDateTime, "yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture).Date;
+        }
+
+        /// <summary>
+        /// The exchange an order should be routed to for the overnight session, or the one already
+        /// chosen when this order is not an overnight order.
+        /// </summary>
+        /// <remarks>
+        /// Kept as a static pure function so the routing rule is testable without a live gateway.
+        /// A caller that already directed the order (options MOO/MOC go to CBOE) wins: the
+        /// overnight branch only fills in an exchange nobody else picked.
+        /// </remarks>
+        internal static string ResolveOvernightExchange(IOrderProperties properties, string currentExchange)
+        {
+            if (currentExchange != null)
+            {
+                return currentExchange;
+            }
+
+            return properties is ArbitrageOrderProperties { OvernightSession: true }
+                ? "OVERNIGHT"
+                : null;
+        }
+
+        /// <summary>
+        /// The IB time-in-force string for the overnight session, or null when this order is not
+        /// an overnight order and the normal conversion applies.
+        /// </summary>
+        /// <remarks>
+        /// OVT, not OND: an OND order that misses the overnight session stays alive into the
+        /// regular session and can fill hours later, by which time the other leg of the pair has
+        /// moved - that is a naked position created out of nothing. An overnight order that does
+        /// not fill overnight must die.
+        /// </remarks>
+        internal static string ResolveOvernightTimeInForce(IOrderProperties properties)
+        {
+            return properties is ArbitrageOrderProperties { OvernightSession: true } ? "OVT" : null;
         }
 
         /// <summary>
