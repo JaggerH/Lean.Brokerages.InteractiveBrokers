@@ -23,6 +23,7 @@ using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Orders.Fees;
+using QuantConnect.Orders.Ledger;
 using QuantConnect.Orders.TimeInForces;
 using QuantConnect.Packets;
 using QuantConnect.Securities;
@@ -3127,7 +3128,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        private Order GetOrder(IB.ExecutionDetailsEventArgs executionDetails)
+        /// <remarks>
+        /// Internal rather than private so the unowned-fill wiring can be locked without an IB
+        /// Gateway — <see cref="Initialize"/> starts IBAutomater, so the tests build the brokerage
+        /// through the parameterless constructor and inject what this method reads.
+        /// </remarks>
+        internal Order GetOrder(IB.ExecutionDetailsEventArgs executionDetails)
         {
             var mappedSymbol = MapSymbol(executionDetails.Contract);
             var orders = _orderProvider.GetOrdersByBrokerageId(executionDetails.Execution.OrderId);
@@ -3142,30 +3148,94 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             if (order == null)
             {
-                if (executionDetails.Execution.Liquidation == 1)
+                var execution = executionDetails.Execution;
+                switch (ClassifyUnownedExecution(execution.Liquidation == 1, orders.Count, execution.OrderRef))
                 {
-                    var currentQuantityFilled = Convert.ToInt32(executionDetails.Execution.Shares);
-                    if (executionDetails.Execution.Side == "SLD")
-                    {
-                        // BOT for bought, SLD for sold
-                        currentQuantityFilled *= -1;
-                    }
-                    order = new MarketOrder(mappedSymbol, currentQuantityFilled, DateTime.UtcNow, "Brokerage Liquidation");
-                    // this event will add the order into the lean engine
-                    OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(order));
-                }
-                else if (orders.Count == 0)
-                {
-                    Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID {executionDetails.Execution.OrderId}");
-                }
-                else
-                {
-                    Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID {executionDetails.Execution.OrderId} " +
-                        $"for symbol {mappedSymbol.ID}. Actual securities traded with this order ID are {string.Join(", ", orders.Select(x => x.Symbol.ID))}");
+                    case UnownedExecutionDisposition.AdoptAndAlarm:
+                        ReportUnownedExecutionCarryingOurKey(execution);
+                        goto case UnownedExecutionDisposition.Adopt;
+
+                    case UnownedExecutionDisposition.Adopt:
+                        var currentQuantityFilled = Convert.ToInt32(execution.Shares);
+                        if (execution.Side == "SLD")
+                        {
+                            // BOT for bought, SLD for sold
+                            currentQuantityFilled *= -1;
+                        }
+                        order = new MarketOrder(mappedSymbol, currentQuantityFilled, DateTime.UtcNow,
+                            execution.Liquidation == 1 ? "Brokerage Liquidation" : "External Order");
+                        // this event will add the order into the lean engine
+                        OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(order));
+                        break;
+
+                    case UnownedExecutionDisposition.LedgerAlarmOnly:
+                        ReportUnownedExecutionCarryingOurKey(execution);
+                        break;
+
+                    case UnownedExecutionDisposition.SymbolMismatch:
+                        Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): Unable to locate order with BrokerageID {execution.OrderId} " +
+                            $"for symbol {mappedSymbol.ID}. Actual securities traded with this order ID are {string.Join(", ", orders.Select(x => x.Symbol.ID))}");
+                        break;
                 }
             }
 
             return order;
+        }
+
+        /// <summary>
+        /// What to do with an execution that resolved to no local order. Pure so the decision table
+        /// can be locked without an IB Gateway; the caller owns the side effects.
+        ///
+        /// Spec: main repo docs/superpowers/specs/2026-08-26-unowned-fill-handling.md.
+        /// Recon that scoped IB's half: docs/research/2026-08-26-ibkr-unowned-fill-recon.md.
+        /// </summary>
+        /// <param name="isLiquidation">IB's <c>Execution.Liquidation == 1</c> — its own statement that
+        /// this is a forced liquidation. Authoritative, and a liquidation must always be followed:
+        /// refusing to adopt one leaves the engine's holdings behind the account with no way back.</param>
+        /// <param name="candidateCount">How many local orders carry this IB order id.</param>
+        /// <param name="orderRef">IB's OrderRef, where this brokerage stamps its client order id.</param>
+        internal static UnownedExecutionDisposition ClassifyUnownedExecution(bool isLiquidation, int candidateCount, string orderRef)
+        {
+            var carriesOurKey = OrderKeyGenerator.IsOurs(orderRef);
+
+            if (isLiquidation)
+            {
+                // IB says it forced this trade, and that outranks everything: a liquidation left
+                // unadopted is holdings silently falling behind the account. If the OrderRef is
+                // nonetheless ours, adopt AND alarm — neither fact may be dropped for the other.
+                return carriesOurKey
+                    ? UnownedExecutionDisposition.AdoptAndAlarm
+                    : UnownedExecutionDisposition.Adopt;
+            }
+
+            if (candidateCount == 0)
+            {
+                // Our shape with nothing local behind it is the ledger-loss alarm, not an unowned
+                // fill. Inventing an order here would silence the loudest signal this system has.
+                // Anything else is genuinely external — an order placed by hand in TWS — and is
+                // adopted so the fill reaches the engine account.
+                return carriesOurKey
+                    ? UnownedExecutionDisposition.LedgerAlarmOnly
+                    : UnownedExecutionDisposition.Adopt;
+            }
+
+            return UnownedExecutionDisposition.SymbolMismatch;
+        }
+
+        /// <summary>
+        /// An execution whose OrderRef has our client order id shape resolved to no local order.
+        /// Mirrors the ledger's own <c>ORDER_LEDGER_UNKNOWN_KEY</c> alarm: the ledger was lost,
+        /// rolled back, or a second writer exists.
+        /// </summary>
+        private void ReportUnownedExecutionCarryingOurKey(Execution execution)
+        {
+            var message = $"IB execution {execution.ExecId} (order {execution.OrderId}) carries OrderRef " +
+                $"{execution.OrderRef}, which has our client order id shape, but no local order matches it — " +
+                "the ledger may be lost, rolled back, or a second writer exists. This fill is NOT being adopted: " +
+                "adopting it would invent an order and bury this alarm.";
+            Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): {message}");
+            _algorithm?.Error(message);
+            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "ORDER_LEDGER_UNKNOWN_KEY", message));
         }
 
         /// <summary>
