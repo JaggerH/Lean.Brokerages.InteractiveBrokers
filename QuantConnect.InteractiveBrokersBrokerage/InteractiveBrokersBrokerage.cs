@@ -1540,6 +1540,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     return false;
                 }
 
+                // No positions-snapshot stamp on this path: the FA group filter answers with positionMulti,
+                // not the full updatePortfolio sweep, so there is nothing here that can endorse
+                // "absence means flat" (docs/superpowers/specs/2026-08-28-binance-ibkr-position-writes-design.md).
                 _client.RequestPositionsMulti(GetNextId(), _financialAdvisorsGroupFilter);
 
                 // Wait for position update to finish
@@ -1826,6 +1829,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 // set up event handlers
                 _client.UpdatePortfolio += HandlePortfolioUpdates;
+                // Resident, not just for the duration of DownloadAccount: IB re-pushes the whole
+                // portfolio periodically, and every batch end is a chance to re-endorse the snapshot.
+                _client.AccountDownloadEnd += HandleAccountDownloadEnd;
                 _client.OrderStatus += HandleOrderStatusUpdates;
                 _client.OpenOrder += HandleOpenOrder;
                 _client.OpenOrderEnd += HandleOpenOrderEnd;
@@ -3381,15 +3387,25 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Trace($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): {e}");
 
+                // Reset before anything that can throw: a row we cannot convert must leave the
+                // download waiting for the real accountDownloadEnd, never riding a stale set flag.
+                _accountHoldingsResetEvent.Reset();
+
+                var symbol = MapSymbol(e.Contract);
+
                 // notify the transaction handler about all option position updates
                 if (e.Contract.SecType is IB.SecurityType.Option or IB.SecurityType.FutureOption)
                 {
-                    var symbol = MapSymbol(e.Contract);
-
                     OnOptionNotification(new OptionNotificationEventArgs(symbol, e.Position));
                 }
 
-                _accountHoldingsResetEvent.Reset();
+                // Every row goes to the data plane, whether or not the engine wants the holdings:
+                // the positions-snapshot stamp claims the batch is complete, and a row skipped here
+                // would make it a lie. Same average-cost normalization as CreateHolding.
+                var multiplier = e.Contract.Multiplier.ConvertInvariant<decimal>();
+                if (multiplier == 0m) multiplier = 1m;
+                RecordVenuePosition(symbol, e.Position, Convert.ToDecimal(e.AverageCost) / multiplier);
+
                 if (_loadExistingHoldings)
                 {
                     var holding = CreateHolding(e);
@@ -3399,6 +3415,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             catch (Exception exception)
             {
                 var contractStr = e.Contract?.ToString();
+
+                // Outside the de-duplicated logging below on purpose: the second time a contract
+                // fails it is still a hole in this batch, and swallowing that would let the stamp
+                // claim a complete sweep.
+                MarkSweepIncomplete($"{contractStr}: {exception.Message}");
+
                 lock (_invalidContracts)
                 {
                     // only log these exceptions once per contracts to avoid a lot of noise in the logs we get them many times
@@ -3426,6 +3448,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
         }
+
+        /// <summary>
+        /// IB finished pushing a full portfolio batch: everything it holds has been written, so the
+        /// snapshot can be endorsed - unless a row of this batch failed to convert.
+        /// </summary>
+        private void HandleAccountDownloadEnd(object sender, IB.AccountDownloadEndEventArgs e) => StampPositionsSnapshot();
 
         /// <summary>
         /// Merges a holding into the current holdings dictionary.
