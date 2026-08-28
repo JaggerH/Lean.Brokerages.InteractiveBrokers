@@ -101,10 +101,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// A row of the batch in flight never reached the data plane, so the batch can no longer
         /// endorse "absence means flat". Voids the stamp for this batch only.
         /// </summary>
+        /// <remarks>
+        /// Called for every failing row, logged at trace: the error-level line naming the contract is
+        /// de-duplicated by the caller, and <see cref="StampPositionsSnapshot"/> reports the withheld
+        /// stamp once per batch. Repeating it per row would only bury both.
+        /// </remarks>
         internal void MarkSweepIncomplete(string why)
         {
             _sweepIncomplete = true;
-            Log.Error($"InteractiveBrokersBrokerage.MarkSweepIncomplete(): {PositionsSnapshotChannel} withheld for this batch: {why}");
+            Log.Trace($"InteractiveBrokersBrokerage.MarkSweepIncomplete(): {PositionsSnapshotChannel} withheld for this batch: {why}");
         }
 
         /// <summary>

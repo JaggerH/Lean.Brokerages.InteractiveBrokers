@@ -1829,8 +1829,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 // set up event handlers
                 _client.UpdatePortfolio += HandlePortfolioUpdates;
-                // Resident, not just for the duration of DownloadAccount: IB re-pushes the whole
-                // portfolio periodically, and every batch end is a chance to re-endorse the snapshot.
+                // Resident, not just for the duration of DownloadAccount: the stamp is laid at the end
+                // of each full download - the initial one and every re-subscription or reconnect after
+                // it - while the rows themselves stay fresh from the streamed updatePortfolio pushes.
                 _client.AccountDownloadEnd += HandleAccountDownloadEnd;
                 _client.OrderStatus += HandleOrderStatusUpdates;
                 _client.OpenOrder += HandleOpenOrder;
@@ -3387,25 +3388,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 Log.Trace($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): {e}");
 
-                // Reset before anything that can throw: a row we cannot convert must leave the
-                // download waiting for the real accountDownloadEnd, never riding a stale set flag.
-                _accountHoldingsResetEvent.Reset();
-
-                var symbol = MapSymbol(e.Contract);
-
                 // notify the transaction handler about all option position updates
                 if (e.Contract.SecType is IB.SecurityType.Option or IB.SecurityType.FutureOption)
                 {
+                    var symbol = MapSymbol(e.Contract);
+
                     OnOptionNotification(new OptionNotificationEventArgs(symbol, e.Position));
                 }
 
-                // Every row goes to the data plane, whether or not the engine wants the holdings:
-                // the positions-snapshot stamp claims the batch is complete, and a row skipped here
-                // would make it a lie. Same average-cost normalization as CreateHolding.
-                var multiplier = e.Contract.Multiplier.ConvertInvariant<decimal>();
-                if (multiplier == 0m) multiplier = 1m;
-                RecordVenuePosition(symbol, e.Position, Convert.ToDecimal(e.AverageCost) / multiplier);
-
+                _accountHoldingsResetEvent.Reset();
                 if (_loadExistingHoldings)
                 {
                     var holding = CreateHolding(e);
@@ -3415,19 +3406,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             catch (Exception exception)
             {
                 var contractStr = e.Contract?.ToString();
-
-                // Outside the de-duplicated logging below on purpose: the second time a contract
-                // fails it is still a hole in this batch, and swallowing that would let the stamp
-                // claim a complete sweep.
-                MarkSweepIncomplete($"{contractStr}: {exception.Message}");
-
-                lock (_invalidContracts)
+                if (ShouldReportInvalidContract(contractStr))
                 {
-                    // only log these exceptions once per contracts to avoid a lot of noise in the logs we get them many times
-                    if (string.IsNullOrEmpty(contractStr) || _invalidContracts.Add(contractStr))
-                    {
-                        Log.Error($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): {exception}");
-                    }
+                    Log.Error($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): {exception}");
                 }
 
                 if (e.Position != 0)
@@ -3447,6 +3428,53 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                 }
             }
+
+            // The data plane gets every row, whether or not the engine wants the holdings: the
+            // positions-snapshot stamp claims the batch is complete, and a row skipped here would
+            // make it a lie. Its own try/catch on purpose - a row that only the data plane cares
+            // about must void the stamp, and must NOT reach the escalation above, which fails
+            // DownloadAccount() and with it Connect(). That escalation stays reachable from exactly
+            // the rows it was reachable from before: option notifications and CreateHolding.
+            try
+            {
+                RecordVenuePosition(MapSymbol(e.Contract), e.Position, GetAveragePricePerUnit(e));
+            }
+            catch (Exception exception)
+            {
+                var contractStr = e.Contract?.ToString();
+                MarkSweepIncomplete($"{contractStr}: {exception.Message}");
+
+                // Same de-dup as above: IB re-pushes the same unconvertible contract on every batch.
+                // The withholding itself is reported once per batch by StampPositionsSnapshot.
+                if (ShouldReportInvalidContract(contractStr))
+                {
+                    Log.Error($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): data-plane write failed, {exception}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether this contract's conversion failure is worth a log line, or has already had one.
+        /// IB re-pushes a bad contract on every portfolio batch, so without this the log is nothing else.
+        /// </summary>
+        private bool ShouldReportInvalidContract(string contractStr)
+        {
+            lock (_invalidContracts)
+            {
+                return string.IsNullOrEmpty(contractStr) || _invalidContracts.Add(contractStr);
+            }
+        }
+
+        /// <summary>
+        /// IB reports average cost per contract; Lean quotes average price per unit. Shared by the
+        /// holdings path and the data-plane path so the two cannot drift apart.
+        /// </summary>
+        private static decimal GetAveragePricePerUnit(IB.UpdatePortfolioEventArgs e)
+        {
+            var multiplier = e.Contract.Multiplier.ConvertInvariant<decimal>();
+            if (multiplier == 0m) multiplier = 1m;
+
+            return Convert.ToDecimal(e.AverageCost) / multiplier;
         }
 
         /// <summary>
@@ -4509,14 +4537,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 e.Contract.Currency ??
                 _symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, Currencies.USD).QuoteCurrency);
 
-            var multiplier = e.Contract.Multiplier.ConvertInvariant<decimal>();
-            if (multiplier == 0m) multiplier = 1m;
-
             return new Holding
             {
                 Symbol = symbol,
                 Quantity = e.Position,
-                AveragePrice = Convert.ToDecimal(e.AverageCost) / multiplier,
+                AveragePrice = GetAveragePricePerUnit(e),
                 MarketPrice = Convert.ToDecimal(e.MarketPrice),
                 CurrencySymbol = currencySymbol
             };
