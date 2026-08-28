@@ -31,7 +31,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private const string PositionsSnapshotChannel = "positions-snapshot";
 
         // Standalone (not composed) IB runs are US-only in this fork; the composite overrides this.
-        private IReadOnlyList<string> _venueMarkets = new[] { Market.USA };
+        // volatile: written once by the composite on the wiring thread, read from the IB client thread
+        // (HandleBrokerTime) and the algorithm thread (GetAccountHoldings). Whole-list atomic swap.
+        private volatile IReadOnlyList<string> _venueMarkets = new[] { Market.USA };
 
         // Set by DownloadAccount: true only when AccountDownloadEnd arrived inside its window, no
         // holding failed to convert, AND this download actually filled the holdings dictionary.
@@ -57,20 +59,20 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         /// <summary>
         /// Records whether the account download that just finished may vouch for the holdings list.
-        /// Three conditions, all necessary:
-        /// the download ended on its own (<paramref name="downloadSucceeded"/>); nothing failed to
-        /// convert; and <c>_loadExistingHoldings</c> is still set, because that flag gates the only
-        /// writer of <c>_accountData.AccountHoldings</c> (HandlePortfolioUpdates). After the first
-        /// <see cref="GetAccountHoldings"/> clears it, a reconnect's download - which starts from an
-        /// <c>_accountData</c> that Connect() cleared - refills nothing, and a vouch for an empty
-        /// dictionary is exactly the "everything is flat" falsehood this channel exists to prevent.
+        /// Reads DownloadAccount's verdict and narrows it - it must never widen or replace it, because
+        /// that verdict is the connect gate: Connect() throws when it comes back false, so anything
+        /// this method AND-ed into the return value would turn a data-plane concern into a failure to
+        /// connect. It returns nothing for that reason.
+        /// <para>The extra condition is <c>_loadExistingHoldings</c>: that flag gates the only writer
+        /// of <c>_accountData.AccountHoldings</c> (HandlePortfolioUpdates). After the first
+        /// <see cref="GetAccountHoldings"/> clears it, a reconnect's download - starting from an
+        /// <c>_accountData</c> that Connect() cleared - refills nothing, and vouching for an empty
+        /// dictionary is exactly the "everything is flat" falsehood this channel exists to prevent.</para>
         /// </summary>
-        private bool MarkAccountSweepComplete(bool downloadSucceeded)
+        /// <param name="downloadVerdict">What DownloadAccount is about to return.</param>
+        private void RecordAccountSweepOutcome(bool downloadVerdict)
         {
-            _accountSweepComplete = downloadSucceeded
-                && _accountHoldingsLastException == null
-                && _loadExistingHoldings;
-            return _accountSweepComplete;
+            _accountSweepComplete = downloadVerdict && _loadExistingHoldings;
         }
 
         /// <summary>reqCurrentTime answered: the only periodic liveness probe IB gives us (every 2 minutes).</summary>
@@ -109,10 +111,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _accountSweepComplete = false;
         }
 
-        /// <summary>Drives the real three-way condition of <see cref="MarkAccountSweepComplete"/>
-        /// without a gateway: <paramref name="downloadSucceeded"/> stands in for DownloadAccount's
-        /// result, the other two conditions are read from the live fields.</summary>
-        internal bool MarkAccountSweepForTesting(bool downloadSucceeded) => MarkAccountSweepComplete(downloadSucceeded);
+        /// <summary>Drives the real <see cref="RecordAccountSweepOutcome"/> without a gateway:
+        /// <paramref name="downloadVerdict"/> stands in for what DownloadAccount would return.
+        /// Returns nothing - the hook must not be able to stand in for the connect verdict either.</summary>
+        internal void MarkAccountSweepForTesting(bool downloadVerdict) => RecordAccountSweepOutcome(downloadVerdict);
+
+        internal bool AccountSweepCompleteForTesting => _accountSweepComplete;
 
         internal void MarkLoadExistingHoldingsForTesting(bool loadExistingHoldings) => _loadExistingHoldings = loadExistingHoldings;
 

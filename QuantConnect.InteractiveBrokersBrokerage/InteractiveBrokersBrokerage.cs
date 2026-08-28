@@ -1634,10 +1634,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMinutes(30));
             }
 
-            // The whole point of this flag: only a download that ended on its own, converted every
-            // holding, and actually refilled the holdings dictionary may later vouch for "this
-            // contract is not in the list, so it is flat".
-            return MarkAccountSweepComplete(result);
+            // This value is the connect gate - Connect() throws on it - so it must stay exactly what
+            // it always was. The data-plane flag reads it and narrows further; never the other way round.
+            var downloadVerdict = result && _accountHoldingsLastException == null;
+            RecordAccountSweepOutcome(downloadVerdict);
+            return downloadVerdict;
         }
 
         /// <summary>

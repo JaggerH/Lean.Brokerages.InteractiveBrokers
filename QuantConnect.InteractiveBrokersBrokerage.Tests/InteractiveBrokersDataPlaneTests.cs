@@ -26,6 +26,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     /// that a positions sweep is only vouched for when the account download really completed.
     /// </summary>
     [TestFixture]
+    [NonParallelizable] // BrokerageDataService.Instance is process-wide state these tests reset.
     public class InteractiveBrokersDataPlaneTests
     {
         [SetUp]
@@ -78,12 +79,12 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             var brokerage = CreateSweepingBrokerage();
 
-            brokerage.MarkAccountSweepForTesting(downloadSucceeded: false);
+            brokerage.MarkAccountSweepForTesting(downloadVerdict: false);
             brokerage.StampPositionsSnapshotIfSweepComplete();
             Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "positions-snapshot", out _),
                 "下载超时或转换出错时持仓可能不全——此时「没有」不等于「平」");
 
-            brokerage.MarkAccountSweepForTesting(downloadSucceeded: true);
+            brokerage.MarkAccountSweepForTesting(downloadVerdict: true);
             brokerage.StampPositionsSnapshotIfSweepComplete();
             Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "positions-snapshot", out _));
             Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("krx", "positions-snapshot", out _));
@@ -106,7 +107,9 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             ((IMultiMarketVenue)brokerage).SetVenueMarkets(new List<string> { "usa", "krx" });
             brokerage.MarkLoadExistingHoldingsForTesting(false);
 
-            Assert.IsFalse(brokerage.MarkAccountSweepForTesting(downloadSucceeded: true));
+            // 注意：这里只断言"不盖戳"。DownloadAccount 的返回值是连接闸门，它不受这个条件影响。
+            brokerage.MarkAccountSweepForTesting(downloadVerdict: true);
+            Assert.IsFalse(brokerage.AccountSweepCompleteForTesting);
 
             brokerage.StampPositionsSnapshotIfSweepComplete();
             Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "positions-snapshot", out _));
@@ -118,7 +121,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             // 合约转换失败可能发生在下载返回之后的持续持仓推送里，那时候标志位已经是 true 了。
             var brokerage = CreateSweepingBrokerage();
-            Assert.IsTrue(brokerage.MarkAccountSweepForTesting(downloadSucceeded: true));
+            brokerage.MarkAccountSweepForTesting(downloadVerdict: true);
+            Assert.IsTrue(brokerage.AccountSweepCompleteForTesting);
 
             brokerage.MarkAccountHoldingsExceptionForTesting(new System.Exception("contract conversion failed"));
 
