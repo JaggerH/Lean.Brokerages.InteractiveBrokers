@@ -151,5 +151,70 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat(Market.USA, "positions-snapshot", out _));
             Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat(Market.India, "positions-snapshot", out _));
         }
+
+        [Test]
+        public void PositionMissingFromACompleteBatchIsWrittenFlat()
+        {
+            // 断线期间平掉的仓，重连后的全量下载里根本不出现——不写零就永远是那条旧的非零数，
+            // 而这一批还会被盖上戳，等于拿陈数背书「已对平」。
+            var brokerage = new InteractiveBrokersBrokerage();
+            var spy = Symbol.Create("SPY", SecurityType.Equity, Market.USA);
+            var aapl = Symbol.Create("AAPL", SecurityType.Equity, Market.USA);
+
+            brokerage.RecordVenuePosition(spy, 10m, 400m);
+            brokerage.StampPositionsSnapshot();
+
+            brokerage.RecordVenuePosition(aapl, 5m, 200m);
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(spy, out var spyPosition));
+            Assert.AreEqual(0m, spyPosition.Quantity);
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(aapl, out var aaplPosition));
+            Assert.AreEqual(5m, aaplPosition.Quantity);
+        }
+
+        [Test]
+        public void IncompleteBatchZeroesNothing()
+        {
+            // 少了一行的一批证明不了任何东西的缺席，更不能拿它把别的仓写平。
+            var brokerage = new InteractiveBrokersBrokerage();
+            var spy = Symbol.Create("SPY", SecurityType.Equity, Market.USA);
+
+            brokerage.RecordVenuePosition(spy, 10m, 400m);
+            brokerage.StampPositionsSnapshot();
+
+            brokerage.MarkSweepIncomplete("contract conversion failed");
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(spy, out var spyPosition));
+            Assert.AreEqual(10m, spyPosition.Quantity);
+        }
+
+        [Test]
+        public void ASymbolIsWrittenFlatOnceNotOnEveryLaterBatch()
+        {
+            // 反复写零会不断刷新 LastUpdated，把一条早就没人报的仓打扮成新鲜的交易所证据。
+            var brokerage = new InteractiveBrokersBrokerage();
+            var spy = Symbol.Create("SPY", SecurityType.Equity, Market.USA);
+
+            brokerage.RecordVenuePosition(spy, 10m, 400m);
+            brokerage.StampPositionsSnapshot();
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(spy, out var flattened));
+            Assert.AreEqual(0m, flattened.Quantity);
+
+            // 打上哨兵值：再写一次零会把它抹掉，不写则原样留着。
+            BrokerageDataService.Instance.UpdateSecurityPosition(spy, new BrokerageDataService.SecurityPositionData
+            {
+                Quantity = 0m,
+                AveragePrice = 123m
+            });
+
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(spy, out var untouched));
+            Assert.AreEqual(123m, untouched.AveragePrice);
+        }
     }
 }

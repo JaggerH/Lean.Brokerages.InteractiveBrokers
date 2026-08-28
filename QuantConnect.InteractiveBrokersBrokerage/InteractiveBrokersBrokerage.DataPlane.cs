@@ -50,6 +50,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _sweepIncomplete;
         private readonly HashSet<string> _sweptMarkets = new();
 
+        // Everything this connection has ever written a position for, and the subset of it seen
+        // since the last stamp attempt. The difference is what has to be zeroed - see
+        // ZeroOutSymbolsAbsentFromBatch.
+        private readonly HashSet<Symbol> _writtenSymbols = new();
+        private readonly HashSet<Symbol> _batchSymbols = new();
+
         internal IReadOnlyList<string> VenueMarketsForTesting => _venueMarkets;
 
         /// <summary>
@@ -95,6 +101,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             });
 
             _sweptMarkets.Add(symbol.ID.Market);
+            _writtenSymbols.Add(symbol);
+            _batchSymbols.Add(symbol);
         }
 
         /// <summary>
@@ -125,15 +133,56 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             else
             {
+                ZeroOutSymbolsAbsentFromBatch();
+
                 foreach (var market in _venueMarkets.Concat(_sweptMarkets).Distinct())
                 {
                     BrokerageDataService.Instance.RecordChannelHeartbeat(market, PositionsSnapshotChannel);
                 }
             }
 
-            // Both flags belong to the batch that just ended, never to the next one.
+            // All three belong to the batch that just ended, never to the next one.
             _sweepIncomplete = false;
             _sweptMarkets.Clear();
+            _batchSymbols.Clear();
+        }
+
+        /// <summary>
+        /// A position closed while we were away leaves its last non-zero row sitting in the data
+        /// plane: the full download that follows a reconnect carries only positions still open, so
+        /// nothing overwrites it, and the stamp would then endorse stale evidence as a complete
+        /// picture. Anything we have written before and did not hear about in this batch is
+        /// therefore written flat before the stamp goes on.
+        /// </summary>
+        /// <remarks>
+        /// Only safe on a complete batch: a batch missing a row cannot prove absence, so an
+        /// incomplete one zeroes nothing.
+        ///
+        /// After the initial download IB keeps streaming incremental <c>updatePortfolio</c> rows, so
+        /// this window is "everything since the last stamp", not just the download itself. That is
+        /// the right window rather than a loose one: a symbol that moved at all since the last stamp
+        /// is by definition in it, so what the difference selects is symbols absent from the whole
+        /// window - and every such symbol was necessarily absent from the full download that ends it.
+        /// </remarks>
+        private void ZeroOutSymbolsAbsentFromBatch()
+        {
+            foreach (var symbol in _writtenSymbols.Where(symbol => !_batchSymbols.Contains(symbol)).ToList())
+            {
+                BrokerageDataService.Instance.UpdateSecurityPosition(symbol, new BrokerageDataService.SecurityPositionData
+                {
+                    Quantity = 0m,
+                    AveragePrice = 0m,
+                    ChangeReason = BrokerageDataService.PositionChangeReason.Snapshot,
+                    VenueTimeUtc = DateTime.UtcNow
+                });
+
+                // Written flat once, and then forgotten: a symbol IB no longer reports must not be
+                // re-zeroed on every later batch, which would keep refreshing its LastUpdated and
+                // dress a long-dead row up as fresh venue evidence.
+                _writtenSymbols.Remove(symbol);
+
+                Log.Trace($"InteractiveBrokersBrokerage.ZeroOutSymbolsAbsentFromBatch(): {symbol} absent from this batch, written flat.");
+            }
         }
     }
 }
