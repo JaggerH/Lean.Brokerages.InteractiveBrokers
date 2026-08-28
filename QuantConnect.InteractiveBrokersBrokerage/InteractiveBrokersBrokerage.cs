@@ -730,6 +730,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
+            StampPositionsSnapshotIfSweepComplete();
+
             // Prevent holdings calculation every time we receive portfolio updates from IB
             _loadExistingHoldings = false;
 
@@ -1573,6 +1575,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Log.Trace($"InteractiveBrokersBrokerage.DownloadAccount(): Downloading account data for {account}");
 
             _accountHoldingsLastException = null;
+            _accountSweepComplete = false;
             _accountHoldingsResetEvent.Reset();
 
             // define our event handler, this acts as stop to make sure when we leave Connect we have downloaded the full account
@@ -1631,7 +1634,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMinutes(30));
             }
 
-            return result && _accountHoldingsLastException == null;
+            // The whole point of this flag: only a download that ended on its own and converted every
+            // holding may later vouch for "this contract is not in the list, so it is flat".
+            _accountSweepComplete = result && _accountHoldingsLastException == null;
+            return _accountSweepComplete;
         }
 
         /// <summary>
@@ -4645,6 +4651,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void HandleBrokerTime(object sender, IB.CurrentTimeUtcEventArgs e)
         {
             _currentTimeEvent.Set();
+            StampBrokerTime();
         }
 
         /// <summary>
