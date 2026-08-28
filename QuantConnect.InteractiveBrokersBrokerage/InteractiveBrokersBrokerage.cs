@@ -1634,10 +1634,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMinutes(30));
             }
 
-            // The whole point of this flag: only a download that ended on its own and converted every
-            // holding may later vouch for "this contract is not in the list, so it is flat".
-            _accountSweepComplete = result && _accountHoldingsLastException == null;
-            return _accountSweepComplete;
+            // The whole point of this flag: only a download that ended on its own, converted every
+            // holding, and actually refilled the holdings dictionary may later vouch for "this
+            // contract is not in the list, so it is flat".
+            return MarkAccountSweepComplete(result);
         }
 
         /// <summary>

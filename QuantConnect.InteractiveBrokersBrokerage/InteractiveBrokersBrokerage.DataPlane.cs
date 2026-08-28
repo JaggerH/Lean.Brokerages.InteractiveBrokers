@@ -33,9 +33,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // Standalone (not composed) IB runs are US-only in this fork; the composite overrides this.
         private IReadOnlyList<string> _venueMarkets = new[] { Market.USA };
 
-        // Set by DownloadAccount: true only when AccountDownloadEnd arrived inside its window and
-        // no holding failed to convert. Anything else means the holdings list may be partial, and a
-        // partial list must not vouch for absence.
+        // Set by DownloadAccount: true only when AccountDownloadEnd arrived inside its window, no
+        // holding failed to convert, AND this download actually filled the holdings dictionary.
+        // Anything else means the list may be partial, and a partial list must not vouch for absence.
         private volatile bool _accountSweepComplete;
 
         internal IReadOnlyList<string> VenueMarketsForTesting => _venueMarkets;
@@ -53,6 +53,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             _venueMarkets = markets.Select(market => market.ToLowerInvariant()).Distinct().ToList();
+        }
+
+        /// <summary>
+        /// Records whether the account download that just finished may vouch for the holdings list.
+        /// Three conditions, all necessary:
+        /// the download ended on its own (<paramref name="downloadSucceeded"/>); nothing failed to
+        /// convert; and <c>_loadExistingHoldings</c> is still set, because that flag gates the only
+        /// writer of <c>_accountData.AccountHoldings</c> (HandlePortfolioUpdates). After the first
+        /// <see cref="GetAccountHoldings"/> clears it, a reconnect's download - which starts from an
+        /// <c>_accountData</c> that Connect() cleared - refills nothing, and a vouch for an empty
+        /// dictionary is exactly the "everything is flat" falsehood this channel exists to prevent.
+        /// </summary>
+        private bool MarkAccountSweepComplete(bool downloadSucceeded)
+        {
+            _accountSweepComplete = downloadSucceeded
+                && _accountHoldingsLastException == null
+                && _loadExistingHoldings;
+            return _accountSweepComplete;
         }
 
         /// <summary>reqCurrentTime answered: the only periodic liveness probe IB gives us (every 2 minutes).</summary>
@@ -83,8 +101,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 BrokerageDataService.Instance.RecordChannelHeartbeat(market, PositionsSnapshotChannel);
             }
+
+            // One stamp per clean download. GetAccountHoldings is called repeatedly, but only the
+            // first call reads a dictionary this download filled - it then clears
+            // _loadExistingHoldings and the dictionary freezes. A second stamp would report a fresh
+            // sweep that never happened.
+            _accountSweepComplete = false;
         }
 
-        internal void MarkAccountSweepForTesting(bool complete) => _accountSweepComplete = complete;
+        /// <summary>Drives the real three-way condition of <see cref="MarkAccountSweepComplete"/>
+        /// without a gateway: <paramref name="downloadSucceeded"/> stands in for DownloadAccount's
+        /// result, the other two conditions are read from the live fields.</summary>
+        internal bool MarkAccountSweepForTesting(bool downloadSucceeded) => MarkAccountSweepComplete(downloadSucceeded);
+
+        internal void MarkLoadExistingHoldingsForTesting(bool loadExistingHoldings) => _loadExistingHoldings = loadExistingHoldings;
+
+        internal void MarkAccountHoldingsExceptionForTesting(Exception exception) => _accountHoldingsLastException = exception;
     }
 }
