@@ -730,8 +730,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
             }
 
-            StampPositionsSnapshotIfSweepComplete();
-
             // Prevent holdings calculation every time we receive portfolio updates from IB
             _loadExistingHoldings = false;
 
@@ -1575,7 +1573,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Log.Trace($"InteractiveBrokersBrokerage.DownloadAccount(): Downloading account data for {account}");
 
             _accountHoldingsLastException = null;
-            _accountSweepComplete = false;
             _accountHoldingsResetEvent.Reset();
 
             // define our event handler, this acts as stop to make sure when we leave Connect we have downloaded the full account
@@ -1634,11 +1631,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromMinutes(30));
             }
 
-            // This value is the connect gate - Connect() throws on it - so it must stay exactly what
-            // it always was. The data-plane flag reads it and narrows further; never the other way round.
-            var downloadVerdict = result && _accountHoldingsLastException == null;
-            RecordAccountSweepOutcome(downloadVerdict);
-            return downloadVerdict;
+            return result && _accountHoldingsLastException == null;
         }
 
         /// <summary>
