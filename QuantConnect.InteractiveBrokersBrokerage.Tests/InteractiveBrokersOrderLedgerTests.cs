@@ -121,8 +121,11 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void ComboRegistrationWarnsThatOnlyTheFirstLegIsCovered()
+        public void ComboIsRefusedWhenALedgerIsWired()
         {
+            // 明确不支持：账本一条记录对应一张场所订单，combo 的其余腿不可能被逐腿核对。
+            // 带着半覆盖的账本把 combo 下出去，事后长得和全覆盖一模一样——所以拒绝，
+            // 且必须在写入账本之前拒绝（抛出即中止下单，是这条路径的既有约定）。
             var brokerage = new InteractiveBrokersBrokerage();
             var ledger = new RecordingLedger();
             brokerage.WireOrderLedgerForTesting(ledger);
@@ -130,14 +133,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             var messages = new List<BrokerageMessageEvent>();
             brokerage.Message += (_, e) => messages.Add(e);
 
-            var key = brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true);
+            Assert.Throws<NotSupportedException>(
+                () => brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true));
 
-            // One intent under the first leg is the designed shape; doing it silently is not.
-            Assert.IsNotNull(key);
-            Assert.AreEqual(1, ledger.RegisteredOrders.Count);
-            Assert.AreSame(orders[0], ledger.RegisteredOrders[0]);
+            Assert.IsEmpty(ledger.RegisteredOrders, "拒绝必须发生在写账本之前，否则留下一条永远不会被 ack 的意图");
             Assert.AreEqual(1, messages.Count);
-            Assert.AreEqual("ORDER_LEDGER_COMBO_PARTIAL", messages[0].Code);
+            Assert.AreEqual("ORDER_LEDGER_COMBO_UNSUPPORTED", messages[0].Code);
+            Assert.AreEqual(BrokerageMessageType.Error, messages[0].Type);
+        }
+
+        [Test]
+        public void ComboIsAllowedWhenNoLedgerIsWired()
+        {
+            // 配对用例：非套利策略不接账本，它照常可以下 combo——上面那条拒绝只针对
+            // "接了账本"这一种情形，不是把 combo 从这个券商里删掉。
+            var brokerage = new InteractiveBrokersBrokerage();
+            var orders = new List<Order> { NewOrder(), NewOrder() };
+
+            Assert.DoesNotThrow(() => brokerage.ResolveOrderRef(orders, ibOrderId: 1, needsNewId: true));
         }
 
         [Test]

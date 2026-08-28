@@ -13,6 +13,7 @@
  * limitations under the License.
 */
 
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using QuantConnect.Interfaces;
@@ -150,10 +151,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// original placement sent: IB modifies an order by resending it under the same order id,
         /// and minting a second key would open a second ledger entry that nothing ever acks.
         /// </summary>
-        /// <param name="orders">The Lean orders behind this IB order. For a combo this is every
-        /// leg; IB gives the combo a single order id, so a single key is registered against
-        /// <c>orders[0]</c> — the ledger's unit of identity is the exchange order, and the other
-        /// legs share it.</param>
+        /// <param name="orders">The Lean orders behind this IB order. A combo arrives here as every
+        /// leg at once, and is <b>refused</b> when a ledger is wired: the ledger's unit of identity
+        /// is the exchange order, so a combo's legs cannot be reconciled individually. Combos are
+        /// only placeable from a strategy with no ledger.</param>
         /// <param name="ibOrderId">The IB order id this request will use.</param>
         /// <param name="needsNewId">True for a placement, false for a modification.</param>
         /// <returns>The key, or null when there is no ledger to register with.</returns>
@@ -182,16 +183,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             if (orders.Count > 1)
             {
-                // IB gives the whole combo one order id and one OrderRef, so the ledger holds one
-                // intent under orders[0] and cannot account for the other legs individually. Placing
-                // the combo is fine; relying on the ledger for its per-leg accounting is not — and
-                // silence here would look exactly like full coverage.
-                var message = $"combo order (lean order {orders[0].Id} + {orders.Count - 1} more legs): the " +
-                    "order ledger registers one intent for the whole combo under the first leg; the remaining " +
-                    "legs share its key and are NOT individually reconciled. Per-leg ledger accounting for " +
-                    "combo orders is not implemented — see docs/TODO.md before relying on it.";
+                // 明确不支持：IB 给整个 combo 一个订单号、一个 OrderRef，而账本的身份单位是
+                // 「一张场所订单一条意图」，只登记得下 orders[0]，其余腿共用钥匙、不被逐腿核对。
+                // 接了账本就是套利策略，而套利策略不下 combo；要下 combo 的非套利策略不接账本，
+                // 走的是上面 ledger == null 那条路，不受这里影响。所以这里拒绝，而不是带着
+                // 半覆盖的账本下单——半覆盖看起来和全覆盖一模一样。
+                var message = $"combo order (lean order {orders[0].Id} + {orders.Count - 1} more legs) refused: " +
+                    "the order ledger accounts for one intent per exchange order, so a combo's legs cannot be " +
+                    "reconciled individually. Per-leg ledger accounting is deliberately not implemented — " +
+                    "place combos from a strategy that has no order ledger wired, or implement per-leg support " +
+                    "first.";
                 Log.Error($"InteractiveBrokersBrokerage.ResolveOrderRef(): {message}");
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "ORDER_LEDGER_COMBO_PARTIAL", message));
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "ORDER_LEDGER_COMBO_UNSUPPORTED", message));
+                throw new NotSupportedException(message);
             }
 
             // Symbol.ID.Market, not a hardcoded constant and not the brokerage name: IB trades
