@@ -2626,6 +2626,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     AccountBaseCurrency = e.Currency;
                 }
+
+                // Last, so the base currency this same batch may have just taught us is already in
+                // place: everything the margin slot keeps is denominated against it.
+                RecordAccountValue(e.Key, e.Value, e.Currency);
             }
             catch (Exception err)
             {
@@ -3479,9 +3483,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         /// <summary>
         /// IB finished pushing a full portfolio batch: everything it holds has been written, so the
-        /// snapshot can be endorsed - unless a row of this batch failed to convert.
+        /// snapshot can be endorsed - unless a row of this batch failed to convert. The account
+        /// values that arrived with the same batch become the margin slot on the same boundary.
         /// </summary>
-        private void HandleAccountDownloadEnd(object sender, IB.AccountDownloadEndEventArgs e) => StampPositionsSnapshot();
+        private void HandleAccountDownloadEnd(object sender, IB.AccountDownloadEndEventArgs e)
+        {
+            StampPositionsSnapshot();
+            WriteAccountMargin();
+        }
 
         /// <summary>
         /// Merges a holding into the current holdings dictionary.
@@ -6447,6 +6456,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             public const string CashBalance = "CashBalance";
             public const string ExchangeRate = "ExchangeRate";
+
+            // The five the data plane's margin slot is made of - see InteractiveBrokersBrokerage.DataPlane.cs.
+            public const string NetLiquidation = "NetLiquidation";
+            public const string AvailableFunds = "AvailableFunds";
+            public const string ExcessLiquidity = "ExcessLiquidity";
+            public const string InitMarginReq = "InitMarginReq";
+            public const string MaintMarginReq = "MaintMarginReq";
         }
 
         // these are fatal errors from IB

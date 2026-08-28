@@ -26,7 +26,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
     /// and the <c>positions-snapshot</c> stamp land under, that an unusable market registration is
     /// refused outright, and that a sweep which failed to convert a contract stamps nothing — the
     /// stamp means "every holding is written, absence now means flat", so a half-written sweep must
-    /// not carry it.
+    /// not carry it. Plus the margin slot written on that same batch boundary: which rows count as
+    /// the account's own, and that an incomplete set is left unwritten rather than zero-filled.
     /// </summary>
     [TestFixture]
     [NonParallelizable] // BrokerageDataService.Instance is process-wide state these tests reset.
@@ -215,6 +216,129 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.IsTrue(BrokerageDataService.Instance.TryGetSecurityPosition(spy, out var untouched));
             Assert.AreEqual(123m, untouched.AveragePrice);
+        }
+
+        [Test]
+        public void MarginIsWrittenPerRegisteredMarketWhenCoreKeysArrived()
+        {
+            // 一条连接横跨两个市场，账户只有一个：两个 market 各写一份同样的保证金。
+            var brokerage = new InteractiveBrokersBrokerage();
+            ((IMultiMarketVenue)brokerage).SetVenueMarkets(new List<string> { "usa", "cme" });
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000.5", "USD");
+            brokerage.RecordAccountValue("AvailableFunds", "40000.25", "USD");
+            brokerage.RecordAccountValue("ExcessLiquidity", "45000", "USD");
+            brokerage.RecordAccountValue("InitMarginReq", "60000", "USD");
+            brokerage.RecordAccountValue("MaintMarginReq", "55000", "USD");
+
+            brokerage.WriteAccountMargin();
+
+            foreach (var market in new[] { "usa", "cme" })
+            {
+                Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(market, out var margin), market);
+                Assert.AreEqual(100000.5m, margin.TotalEquity, market);
+                Assert.AreEqual(40000.25m, margin.AvailableMargin, market);
+                Assert.AreEqual(45000m, margin.MarginBalance, market);
+                Assert.AreEqual(60000m, margin.InitialMarginUsed, market);
+                Assert.AreEqual(55000m, margin.MaintenanceMarginUsed, market);
+
+                // IB 不报这三个，留默认——不编。
+                Assert.AreEqual(0m, margin.InitialMarginRate, market);
+                Assert.AreEqual(0m, margin.MaintenanceMarginRate, market);
+                Assert.AreEqual(0m, margin.TotalLiability, market);
+
+                Assert.AreNotEqual(default(System.DateTime), margin.LastUpdated, market);
+            }
+        }
+
+        [Test]
+        public void MarginIsNotWrittenWithoutAvailableFunds()
+        {
+            // 可用保证金正是买力模型要读的那个数，缺它写出去的就是一份看着完整、实则没有可用额度的槽位。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.RecordAccountValue("ExcessLiquidity", "45000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetMargin(Market.USA, out _));
+
+            // 下一批补齐了就该写。
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            Assert.AreEqual(40000m, margin.AvailableMargin);
+        }
+
+        [Test]
+        public void BaseCurrencyRowsAreIgnored()
+        {
+            // IB 每个键都推一份 "BASE" 汇总行，混进来就是把两套口径的数搅在一起。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("NetLiquidation", "999999", "BASE");
+            brokerage.RecordAccountValue("AvailableFunds", "999999", "BASE");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetMargin(Market.USA, out _),
+                "只有 BASE 行，等于本币的数一个都没到，不许写。");
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            Assert.AreEqual(100000m, margin.TotalEquity);
+            Assert.AreEqual(40000m, margin.AvailableMargin);
+        }
+
+        [Test]
+        public void ForeignCurrencyRowsAreIgnoredOnceACurrencyIsAccepted()
+        {
+            // 账户里同时有 EUR 头寸，IB 会按币种各推一份；混着累加出来的权益谁也不是。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.RecordAccountValue("NetLiquidation", "7000", "EUR");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            Assert.AreEqual(100000m, margin.TotalEquity);
+        }
+
+        [Test]
+        public void UnparseableValueIsIgnoredNotFatal()
+        {
+            // IB 偶尔推空串或 "N/A"，它只该让这一个键缺席，不该掀掉整批。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            Assert.DoesNotThrow(() => brokerage.RecordAccountValue("NetLiquidation", "N/A", "USD"));
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetMargin(Market.USA, out _),
+                "解析失败的键就是没到，不许拿 0 顶上。");
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            Assert.AreEqual(100000m, margin.TotalEquity);
+        }
+
+        [Test]
+        public void UnrelatedAccountKeysAreNotRecorded()
+        {
+            // 只收这五个键：账户值推送里有上百个键，全存下来只是给自己攒垃圾。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("CashBalance", "100000", "USD");
+            brokerage.RecordAccountValue("BuyingPower", "400000", "USD");
+            brokerage.WriteAccountMargin();
+
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetMargin(Market.USA, out _));
         }
     }
 }

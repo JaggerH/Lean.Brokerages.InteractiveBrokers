@@ -15,6 +15,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using QuantConnect.Logging;
 using QuantConnect.Securities.UnifiedMargin;
@@ -25,13 +26,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     /// Data-plane writes. One IB connection serves several markets, and the data plane keys by
     /// <see cref="SecurityIdentifier.Market"/>, so every account-level signal is written once per
     /// registered market: the connection dying darkens all of them together.
-    /// <para>Heartbeats and positions, no balances. Every <c>updatePortfolio</c> row IB pushes is
+    /// <para>Heartbeats, positions and account margin, no per-currency cash. Every <c>updatePortfolio</c> row IB pushes is
     /// written as a venue-reported position; <c>accountDownloadEnd</c> closes the batch and stamps
     /// <c>positions-snapshot</c> — but only when no contract in that batch failed to convert. That
     /// channel means "every holding is already written, absence from the list now means flat", so a
     /// batch missing a row must not carry it: it would turn the missing leg into a BALANCED backed
-    /// by no venue evidence. Per-currency cash and margin are not written here (see
-    /// <c>docs/superpowers/specs/2026-08-28-binance-ibkr-position-writes-design.md</c>).</para>
+    /// by no venue evidence. The account values IB pushes alongside become the margin slot on that
+    /// same boundary, so the buying-power reader gets IB's own available funds instead of a
+    /// one-times-leverage guess. Per-currency cash is not written here (see
+    /// <c>docs/superpowers/specs/2026-08-28-binance-ibkr-position-writes-design.md</c> and
+    /// <c>docs/superpowers/specs/2026-08-28-binance-ibkr-margin-slot-design.md</c>).</para>
     /// </summary>
     public sealed partial class InteractiveBrokersBrokerage : IMultiMarketVenue
     {
@@ -55,6 +59,25 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // ZeroOutSymbolsAbsentFromBatch.
         private readonly HashSet<Symbol> _writtenSymbols = new();
         private readonly HashSet<Symbol> _batchSymbols = new();
+
+        private const string BaseCurrencyRow = "BASE";
+
+        /// <summary>The five account values the margin slot is made of. Everything else IB pushes is ignored.</summary>
+        private static readonly HashSet<string> MarginAccountValueKeys = new()
+        {
+            AccountValueKeys.NetLiquidation,
+            AccountValueKeys.AvailableFunds,
+            AccountValueKeys.ExcessLiquidity,
+            AccountValueKeys.InitMarginReq,
+            AccountValueKeys.MaintMarginReq
+        };
+
+        // Filled by updateAccountValue and drained by accountDownloadEnd, both on the IB client
+        // thread and in order - same reason the sweep fields above take no lock. _marginCurrency is
+        // the currency the accumulated rows are denominated in; see RecordAccountValue for why it is
+        // not simply AccountBaseCurrency.
+        private readonly Dictionary<string, decimal> _marginAccountValues = new();
+        private string _marginCurrency;
 
         internal IReadOnlyList<string> VenueMarketsForTesting => _venueMarkets;
 
@@ -145,6 +168,101 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _sweepIncomplete = false;
             _sweptMarkets.Clear();
             _batchSymbols.Clear();
+        }
+
+        /// <summary>
+        /// One <c>updateAccountValue</c> row. Keeps the five keys the margin slot needs, denominated
+        /// in the account's base currency, and drops everything else.
+        /// </summary>
+        /// <remarks>
+        /// IB pushes each key once per currency the account holds, plus a <c>BASE</c> summary row;
+        /// mixing those would add up to a number denominated in nothing. The base currency itself is
+        /// only learned from the first <c>ExchangeRate == 1</c> row, which can arrive after these, so
+        /// until it does the first non-<c>BASE</c> currency seen is accepted and everything else in
+        /// that batch is measured against it. If the real base currency then turns out to be another
+        /// one, the rows accumulated under the guess are dropped rather than blended.
+        /// </remarks>
+        internal void RecordAccountValue(string key, string value, string currency)
+        {
+            if (!MarginAccountValueKeys.Contains(key) || string.IsNullOrEmpty(currency) || currency == BaseCurrencyRow)
+            {
+                return;
+            }
+
+            var baseCurrencyKnown = !string.IsNullOrEmpty(AccountBaseCurrency);
+            var expected = baseCurrencyKnown ? AccountBaseCurrency : _marginCurrency ?? currency;
+            if (currency != expected)
+            {
+                return;
+            }
+
+            if (_marginCurrency != expected)
+            {
+                if (_marginCurrency != null)
+                {
+                    Log.Trace($"InteractiveBrokersBrokerage.RecordAccountValue(): account base currency is {expected}, dropping margin rows accumulated under {_marginCurrency}.");
+                    _marginAccountValues.Clear();
+                }
+                else if (!baseCurrencyKnown)
+                {
+                    Log.Trace($"InteractiveBrokersBrokerage.RecordAccountValue(): account base currency not known yet, taking margin rows in {currency}.");
+                }
+
+                _marginCurrency = expected;
+            }
+
+            if (!decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed))
+            {
+                // Dropped, never defaulted to zero: a zero AvailableMargin reads as "no buying power",
+                // and a zero TotalEquity reads as an empty account. Absence is the honest answer.
+                Log.Error($"InteractiveBrokersBrokerage.RecordAccountValue(): {key} ({currency}) value '{value}' is not a number, ignoring this key.");
+                return;
+            }
+
+            _marginAccountValues[key] = parsed;
+        }
+
+        /// <summary>
+        /// <c>accountDownloadEnd</c>: writes the accumulated account values into the data plane's
+        /// margin slot, once per registered market. Needs both <c>NetLiquidation</c> and
+        /// <c>AvailableFunds</c> - equity without available margin is not a slot the buying-power
+        /// reader can use, and a partial one written anyway would look exactly like a complete one.
+        /// </summary>
+        /// <remarks>
+        /// The accumulated values are deliberately NOT cleared: IB streams incremental
+        /// <c>updateAccountValue</c> rows and only re-pushes what changed, so clearing would make
+        /// every later batch look incomplete. The next value for a key overwrites the last.
+        /// Rate fields and <c>TotalLiability</c> stay at their defaults - IB does not report them,
+        /// and deriving them here would put a made-up number where a reported one belongs.
+        /// </remarks>
+        internal void WriteAccountMargin()
+        {
+            if (!_marginAccountValues.TryGetValue(AccountValueKeys.NetLiquidation, out var netLiquidation) ||
+                !_marginAccountValues.TryGetValue(AccountValueKeys.AvailableFunds, out var availableFunds))
+            {
+                Log.Trace("InteractiveBrokersBrokerage.WriteAccountMargin(): NetLiquidation and/or AvailableFunds missing, margin not written.");
+                return;
+            }
+
+            var margin = new BrokerageDataService.AccountMarginData
+            {
+                TotalEquity = netLiquidation,
+                AvailableMargin = availableFunds,
+                MarginBalance = ValueOrDefault(AccountValueKeys.ExcessLiquidity),
+                InitialMarginUsed = ValueOrDefault(AccountValueKeys.InitMarginReq),
+                MaintenanceMarginUsed = ValueOrDefault(AccountValueKeys.MaintMarginReq),
+                LastUpdated = DateTime.UtcNow
+            };
+
+            foreach (var market in _venueMarkets)
+            {
+                BrokerageDataService.Instance.UpdateMargin(market, margin);
+            }
+        }
+
+        private decimal ValueOrDefault(string key)
+        {
+            return _marginAccountValues.TryGetValue(key, out var value) ? value : default;
         }
 
         /// <summary>
