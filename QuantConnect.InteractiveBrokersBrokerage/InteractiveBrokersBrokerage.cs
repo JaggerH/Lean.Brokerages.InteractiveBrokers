@@ -1101,14 +1101,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <see cref="IExecutionHistoryProvider.DescribeExecutionHistoryCoverage"/>.
         /// </summary>
         /// <remarks>
-        /// Two real blind spots, both stated rather than left to the interface's generic default:
+        /// Two things to know, both stated rather than left to the interface's generic default:
         ///
-        /// 1. THE FILTER IS SCOPED TO THIS API CLIENT. <see cref="GetExecutionHistory"/> sets
-        ///    <c>ExecutionFilter.ClientId</c> to this connection's client id, so a fill placed by
-        ///    hand in TWS, or by another process sharing the account under a different client id, is
-        ///    not in the answer. That is the right scope for reconciling OUR orders — an unrelated
-        ///    process's fills have no local order to reconcile against — but it means this method
-        ///    must never be read as "nothing happened on the account".
+        /// 1. THE CLIENT-ID FILTER DOES NOT HIDE FOREIGN FILLS. <see cref="GetExecutionHistory"/>
+        ///    sets <c>ExecutionFilter.ClientId</c> to this connection's id (0), and measured on the
+        ///    paper account (2026-08-26, <c>InteractiveBrokersUnownedExecutionVisibilityProbe</c>,
+        ///    docs/research/2026-08-26-ibkr-unowned-fill-recon.md Q3) fills placed under ANOTHER
+        ///    api client id still come back through this query. Client 0 is IB's master identity -
+        ///    the one that can see and cancel TWS hand-placed orders (see <c>ClientId</c> above) - so
+        ///    the query is the restart-recovery path for foreign fills. What the same probe showed
+        ///    is that such fills are NOT pushed in real time to this connection; that limit lives on
+        ///    the adoption path, not here. Still unmeasured: a TWS hand-placed order (needs real
+        ///    TWS, the gateway has no trading UI) and an IB-generated liquidation.
         /// 2. IB KEEPS 24 HOURS OF EXECUTIONS. IB's own words on the <c>execDetails</c> callback:
         ///    "Returns executions from the last 24 hours as a response to reqExecutions()". A window
         ///    older than that comes back empty because the records aged out, not because nothing
@@ -1120,8 +1124,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// goes out as an EXECUTION_HISTORY_SKIPPED brokerage message naming each one.
         /// </remarks>
         public string DescribeExecutionHistoryCoverage() =>
-            $"IB was asked for account {_account} filtered to this API client id ({ClientId}), so fills placed by " +
-            "hand in TWS or by another process on the same account are NOT in this answer. IB also only keeps " +
+            $"IB was asked for account {_account} as API client {ClientId} (the master client); measured 2026-08-26, " +
+            "fills placed under another api client id DO come back through this query, TWS hand-placed orders and " +
+            "IB liquidations remain unmeasured. IB also only keeps " +
             $"{ExecutionLookbackWindow.TotalHours}h of executions, so a window older than that reports no fills " +
             "because the records aged out, not because nothing traded.";
 
@@ -3146,7 +3151,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </remarks>
         internal Order GetOrder(IB.ExecutionDetailsEventArgs executionDetails)
         {
-            var mappedSymbol = MapSymbol(executionDetails.Contract);
+            Symbol mappedSymbol;
+            try
+            {
+                mappedSymbol = MapSymbol(executionDetails.Contract);
+            }
+            catch (Exception err)
+            {
+                // An instrument this algorithm cannot even name: nothing below can adopt it (there
+                // is no Symbol to build an order on), so the ONLY thing that must not happen is
+                // silence. Before this guard the throw was swallowed by HandleExecutionDetails'
+                // catch as a bare Log.Error, and a liquidation on such an instrument never reached
+                // the unowned-fill classification at all. Warning, not Error: an Error halts the
+                // algorithm without flattening, which for a fill on something we do not trade is
+                // strictly worse than trading on.
+                ReportUnmappableExecution(executionDetails, err);
+                return null;
+            }
             var orders = _orderProvider.GetOrdersByBrokerageId(executionDetails.Execution.OrderId);
             // Already symbol-filtered, unlike the other inbound lookups. Two behaviours to know about:
             // a lone candidate is taken without checking its symbol (same reasoning as
@@ -3238,6 +3259,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// Mirrors the ledger's own <c>ORDER_LEDGER_UNKNOWN_KEY</c> alarm: the ledger was lost,
         /// rolled back, or a second writer exists.
         /// </summary>
+        /// <summary>
+        /// Brokerage message code for a fill on an instrument <see cref="MapSymbol"/> cannot
+        /// represent. The fill is dropped - it cannot be adopted without a Symbol - but the account
+        /// DID change, so it must be said out loud, liquidation flag included.
+        /// </summary>
+        public const string UnmappableExecutionCode = "EXECUTION_UNMAPPABLE_INSTRUMENT";
+
+        private void ReportUnmappableExecution(IB.ExecutionDetailsEventArgs executionDetails, Exception err)
+        {
+            var execution = executionDetails.Execution;
+            var message = $"IB execution {execution.ExecId} (order {execution.OrderId}, {execution.Side} {execution.Shares}" +
+                $"{(execution.Liquidation == 1 ? ", LIQUIDATION" : string.Empty)}) is on " +
+                $"{GetContractDescription(executionDetails.Contract)}, which cannot be mapped to a LEAN symbol: {err.Message}. " +
+                "This fill is DROPPED - the account position on that instrument changed and nothing here tracks it.";
+            Log.Error($"InteractiveBrokersBrokerage.HandleExecutionDetails(): {message}");
+            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, UnmappableExecutionCode, message));
+        }
+
         private void ReportUnownedExecutionCarryingOurKey(Execution execution)
         {
             var message = $"IB execution {execution.ExecId} (order {execution.OrderId}) carries OrderRef " +

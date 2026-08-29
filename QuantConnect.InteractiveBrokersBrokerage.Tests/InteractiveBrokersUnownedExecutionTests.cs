@@ -14,6 +14,7 @@
 */
 
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using IBApi;
 using NUnit.Framework;
@@ -171,6 +172,31 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
 
             Assert.IsNull(order);
             Assert.IsEmpty(adopted, "our key shape with no local order is an alarm, never an adoption");
+        }
+
+        [Test]
+        public void UnmappableInstrumentIsDroppedLoudly_EvenWhenItIsALiquidation()
+        {
+            // MapSymbol runs before every judgement. An instrument this algorithm cannot name used
+            // to throw straight into HandleExecutionDetails' catch - a bare Log.Error, and a
+            // liquidation on it never even reached the classification. It still cannot be adopted
+            // (no Symbol to build an order on), so the contract is: dropped, but announced.
+            var brokerage = NewOfflineBrokerage(out var adopted);
+            var messages = new List<BrokerageMessageEvent>();
+            brokerage.Message += (_, m) => messages.Add(m);
+
+            var contract = new Contract { Symbol = "US-T", SecType = "BOND", Currency = "USD", Exchange = "SMART" };
+            var execution = new Execution { OrderId = 42, ExecId = "0001-bond", Shares = 5, Side = "SLD", Liquidation = 1, OrderRef = string.Empty };
+
+            var order = brokerage.GetOrder(new IB.ExecutionDetailsEventArgs(requestId: 0, contract, execution));
+
+            Assert.IsNull(order);
+            Assert.IsEmpty(adopted, "an order without a Symbol cannot be adopted");
+            var report = messages.SingleOrDefault(m => m.Code == InteractiveBrokersBrokerage.UnmappableExecutionCode);
+            Assert.IsNotNull(report, "the drop must go out as a brokerage message, not only a log line");
+            Assert.AreEqual(BrokerageMessageType.Warning, report.Type, "an Error halts without flattening");
+            StringAssert.Contains("LIQUIDATION", report.Message);
+            StringAssert.Contains("0001-bond", report.Message);
         }
 
         [Test]
