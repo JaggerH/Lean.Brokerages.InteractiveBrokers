@@ -5288,6 +5288,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 };
 
                 _aggregator.Update(tick);
+                // Feed liveness for the adjudicator's G4. Without this the equity leg never appears
+                // in market_data_feeds and "not listed" is indistinguishable from "alive". IB has
+                // no keepalive - a quiet symbol simply sends nothing - so the silence threshold
+                // for this venue is a property of the symbol, not of the socket.
+                RecordFeedMessage(symbol);
+            }
+        }
+
+        /// <summary>
+        /// Reports a tick to <see cref="QuantConnect.Securities.UnifiedMargin.BrokerageDataService"/>,
+        /// which is what carries feed liveness out of this process. Never throws: this runs on the
+        /// tick path and an escape here would take down the feed it is only observing.
+        /// </summary>
+        private static void RecordFeedMessage(Symbol symbol)
+        {
+            try
+            {
+                QuantConnect.Securities.UnifiedMargin.BrokerageDataService.Instance
+                    .RecordMarketDataMessage(symbol, movedTheBook: true, sequenceId: 0);
+            }
+            catch (Exception err)
+            {
+                Log.Error($"InteractiveBrokersBrokerage.RecordFeedMessage(): {err}");
             }
         }
 
