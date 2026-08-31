@@ -247,6 +247,10 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 Assert.AreEqual(0m, margin.MaintenanceMarginRate, market);
                 Assert.AreEqual(0m, margin.TotalLiability, market);
 
+                // 两份拷贝共享同一个账户资金池：池标识让按 venue 枚举的消费者（监控）能把
+                // 它们归并成一行，而不是当成两个账户重复计数。
+                Assert.AreEqual("ibkr", margin.MarginPool, market);
+
                 Assert.AreNotEqual(default(System.DateTime), margin.LastUpdated, market);
             }
         }

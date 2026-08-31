@@ -251,6 +251,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 MarginBalance = ValueOrDefault(AccountValueKeys.ExcessLiquidity),
                 InitialMarginUsed = ValueOrDefault(AccountValueKeys.InitMarginReq),
                 MaintenanceMarginUsed = ValueOrDefault(AccountValueKeys.MaintMarginReq),
+                // One IB account backs every registered market, so the copies below are the SAME
+                // pool. The pool id lets a consumer that enumerates venues (monitoring) merge them
+                // instead of double-counting; per-market readers ignore it.
+                MarginPool = "ibkr",
                 LastUpdated = DateTime.UtcNow
             };
 
