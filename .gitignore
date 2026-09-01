@@ -39,7 +39,10 @@
 !research/run_docker_notebook.sh
 
 # QC Config Files:
-# config.json
+config.json
+# Specifically ignore config.json in test directory (contains credentials)
+**/Tests/config.json
+QuantConnect.InteractiveBrokersBrokerage.Tests/config.json
 
 # QC-C-Specific
 *Engine/bin/Debug/cache/data/*.zip
