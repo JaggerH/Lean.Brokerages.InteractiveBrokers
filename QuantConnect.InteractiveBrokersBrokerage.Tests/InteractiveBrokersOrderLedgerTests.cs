@@ -42,6 +42,8 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         {
             public readonly List<Order> RegisteredOrders = new List<Order>();
 
+            public string Directory { get; } = "fake-ledger-dir";
+
             public string RegisterIntent(Order order, string venue, OrderKeyConstraint constraint)
             {
                 RegisteredOrders.Add(order);
