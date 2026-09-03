@@ -41,6 +41,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     {
         private const string BrokerTimeChannel = "broker-time";
         private const string PositionsSnapshotChannel = "positions-snapshot";
+        /// <summary>Stamped at every accountDownloadEnd (~3 min): the account channel is being served.</summary>
+        private const string AccountUpdatesChannel = "account-updates";
 
         // Standalone (not composed) IB runs are US-only in this fork; the composite overrides this.
         // volatile: written once by the composite on the wiring thread, read from the IB client thread
@@ -96,7 +98,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _venueMarkets = markets.Select(market => market.ToLowerInvariant()).Distinct().ToList();
         }
 
-        /// <summary>reqCurrentTime answered: the only periodic liveness probe IB gives us (every 2 minutes).</summary>
+        /// <summary>reqCurrentTime answered (every 2 minutes, but not after 23:00 local nor inside gateway reset windows - see AccountUpdatesChannel for the probe that never goes dark).</summary>
         internal void StampBrokerTime()
         {
             foreach (var market in _venueMarkets)
@@ -150,6 +152,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         internal void StampPositionsSnapshot()
         {
+            // The batch arriving at all is the liveness evidence for the account channel: IB
+            // pushes one every ~3 minutes for as long as the subscription is served, with no
+            // "lights out" hours - unlike broker-time, which HeartBeat() withholds after 23:00
+            // local and inside the gateway's reset windows while the account data keeps flowing
+            // (tradfi 2026-09-02: 2h13m/day of reconciliation judged UNVERIFIED on a healthy
+            // connection). Stamped BEFORE the completeness check on purpose: an incomplete sweep
+            // voids the position list, not the fact that the channel delivered.
+            foreach (var market in _venueMarkets)
+            {
+                BrokerageDataService.Instance.RecordChannelHeartbeat(market, AccountUpdatesChannel);
+            }
+
             if (_sweepIncomplete)
             {
                 Log.Error($"InteractiveBrokersBrokerage.StampPositionsSnapshot(): batch incomplete, not stamping {PositionsSnapshotChannel}.");

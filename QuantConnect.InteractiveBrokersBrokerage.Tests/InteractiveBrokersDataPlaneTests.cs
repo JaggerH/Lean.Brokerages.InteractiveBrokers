@@ -137,6 +137,24 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
+        public void BatchEndStampsAccountUpdatesUnderEveryRegisteredMarketEvenWhenTheSweepWasIncomplete()
+        {
+            // 判活戳证明的是「账户推送还在送」，和 positions-snapshot 证明的「名单完整」是两件事：
+            // 一条持仓没转换成功只作废名单，不作废「通道活着」。broker-time 每天固定两段不盖
+            // （23:00 UTC 后的心跳关灯、网关重置窗口），账户批次却 3 分钟一批照到——裁决器要看后者。
+            var brokerage = new InteractiveBrokersBrokerage();
+            ((IMultiMarketVenue)brokerage).SetVenueMarkets(new List<string> { "usa", "oanda" });
+
+            brokerage.MarkSweepIncomplete("contract conversion failed");
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "account-updates", out _));
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("oanda", "account-updates", out _));
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "positions-snapshot", out _),
+                "名单不完整那一轮仍不许盖 positions-snapshot——两个戳各证各的。");
+        }
+
+        [Test]
         public void StampedMarketsResetBetweenSweeps()
         {
             // 上一轮出现过的 market 不能粘住：这一轮 IB 没推它，就没有全量名单可背书。
