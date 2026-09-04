@@ -81,6 +81,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<UpdatePortfolioEventArgs> UpdatePortfolio;
 
         /// <summary>
+        /// UpdateAccountTime event handler
+        /// </summary>
+        public event EventHandler<UpdateAccountTimeEventArgs> UpdateAccountTime;
+
+        /// <summary>
         /// AccountDownloadEnd event handler
         /// </summary>
         public event EventHandler<AccountDownloadEndEventArgs> AccountDownloadEnd;
@@ -471,6 +476,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         }
 
         /// <summary>
+        /// Receives the time IB stamped on the account-update batch it just pushed (reqAccountUpdates subscription).
+        /// Sent with every batch, whether or not any value or position changed - unlike accountDownloadEnd,
+        /// which only closes a full download (initial subscription and reconnects).
+        /// </summary>
+        /// <param name="timestamp">The batch time as sent on the wire (HH:mm).</param>
+        public override void updateAccountTime(string timestamp)
+        {
+            OnUpdateAccountTime(new UpdateAccountTimeEventArgs(timestamp));
+        }
+
+        /// <summary>
         /// This event is called when the receipt of an account's information has been completed.
         /// </summary>
         /// <param name="account">The account ID.</param>
@@ -769,6 +785,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         protected virtual void OnUpdatePortfolio(UpdatePortfolioEventArgs e)
         {
             UpdatePortfolio?.Invoke(this, e);
+        }
+
+        /// <summary>
+        /// UpdateAccountTime event invocator
+        /// </summary>
+        protected virtual void OnUpdateAccountTime(UpdateAccountTimeEventArgs e)
+        {
+            UpdateAccountTime?.Invoke(this, e);
         }
 
         /// <summary>

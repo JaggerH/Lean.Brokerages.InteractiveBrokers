@@ -137,7 +137,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
         }
 
         [Test]
-        public void BatchEndStampsAccountUpdatesUnderEveryRegisteredMarketEvenWhenTheSweepWasIncomplete()
+        public void AccountBatchStampsAccountUpdatesUnderEveryRegisteredMarketEvenWhenTheSweepWasIncomplete()
         {
             // 判活戳证明的是「账户推送还在送」，和 positions-snapshot 证明的「名单完整」是两件事：
             // 一条持仓没转换成功只作废名单，不作废「通道活着」。broker-time 每天固定两段不盖
@@ -146,12 +146,91 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             ((IMultiMarketVenue)brokerage).SetVenueMarkets(new List<string> { "usa", "oanda" });
 
             brokerage.MarkSweepIncomplete("contract conversion failed");
+            brokerage.OnAccountBatchDelivered();
             brokerage.StampPositionsSnapshot();
 
             Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "account-updates", out _));
             Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat("oanda", "account-updates", out _));
             Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat("usa", "positions-snapshot", out _),
                 "名单不完整那一轮仍不许盖 positions-snapshot——两个戳各证各的。");
+        }
+
+        [Test]
+        public void FullDownloadEndDoesNotStampAccountUpdates()
+        {
+            // accountDownloadEnd 只在初次订阅和重连后各来一次（tradfi 2026-09-03：全天两次，
+            // 05:09 开机、12:19 重登录），把判活戳挂在它上面等于把"刚重连过"当成"通道还在送"，
+            // 门槛无论取多少都必然超时。判活只认 updateAccountTime。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordVenuePosition(Symbol.Create("SPY", SecurityType.Equity, Market.USA), 10m, 400m);
+            brokerage.StampPositionsSnapshot();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetChannelHeartbeat(Market.USA, "positions-snapshot", out _));
+            Assert.IsFalse(BrokerageDataService.Instance.TryGetChannelHeartbeat(Market.USA, "account-updates", out _),
+                "全量下载结束不是账户通道的判活证据。");
+        }
+
+        [Test]
+        public void AccountBatchWritesMarginFromTheValuesAccumulatedSinceTheLastOne()
+        {
+            // 保证金槽随每批 updateAccountTime 刷新，不等下一次全量下载：读它的买力口径只信 300s 内
+            // 的槽，挂在 accountDownloadEnd 上时 Redis 里那份曾陈旧近 3 小时而下单决策照读。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.OnAccountBatchDelivered();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            Assert.AreEqual(40000m, margin.AvailableMargin);
+            var firstWrite = margin.LastUpdated;
+
+            // 下一批只推变化的那一个 key：其余沿用上一批，槽整份重写、时间戳前移。
+            System.Threading.Thread.Sleep(5);
+            brokerage.RecordAccountValue("AvailableFunds", "39000", "USD");
+            brokerage.OnAccountBatchDelivered();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out margin));
+            Assert.AreEqual(100000m, margin.TotalEquity);
+            Assert.AreEqual(39000m, margin.AvailableMargin);
+            Assert.Greater(margin.LastUpdated, firstWrite);
+        }
+
+        [Test]
+        public void QuietAccountBatchStillRefreshesTheMarginTimestamp()
+        {
+            // 一批里什么 key 都没变（隔夜空仓就是这样）也要重写：槽的读者按 LastUpdated 判新鲜，
+            // "没变化就不写"会让一份仍然正确的保证金在第二批之后被当成陈旧而弃用。
+            var brokerage = new InteractiveBrokersBrokerage();
+
+            brokerage.RecordAccountValue("NetLiquidation", "100000", "USD");
+            brokerage.RecordAccountValue("AvailableFunds", "40000", "USD");
+            brokerage.OnAccountBatchDelivered();
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out var margin));
+            var firstWrite = margin.LastUpdated;
+
+            System.Threading.Thread.Sleep(5);
+            brokerage.OnAccountBatchDelivered();
+
+            Assert.IsTrue(BrokerageDataService.Instance.TryGetMargin(Market.USA, out margin));
+            Assert.AreEqual(40000m, margin.AvailableMargin);
+            Assert.Greater(margin.LastUpdated, firstWrite);
+        }
+
+        [Test]
+        public void ClientRoutesUpdateAccountTimeToItsEvent()
+        {
+            // 线路回调 → 事件这一跳没有网关也能验：少了这个 override，DefaultEWrapper 会把
+            // updateAccountTime 静默吞掉，判活戳永远盖不上而没有任何报错。
+            using var client = new QuantConnect.Brokerages.InteractiveBrokers.Client.InteractiveBrokersClient(
+                new IBApi.EReaderMonitorSignal());
+            string received = null;
+            client.UpdateAccountTime += (_, e) => received = e.Timestamp;
+
+            client.updateAccountTime("15:17");
+
+            Assert.AreEqual("15:17", received);
         }
 
         [Test]

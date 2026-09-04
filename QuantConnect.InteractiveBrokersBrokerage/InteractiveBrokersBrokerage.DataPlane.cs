@@ -31,9 +31,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     /// <c>positions-snapshot</c> — but only when no contract in that batch failed to convert. That
     /// channel means "every holding is already written, absence from the list now means flat", so a
     /// batch missing a row must not carry it: it would turn the missing leg into a BALANCED backed
-    /// by no venue evidence. The account values IB pushes alongside become the margin slot on that
-    /// same boundary, so the buying-power reader gets IB's own available funds instead of a
-    /// one-times-leverage guess. Per-currency cash is not written here (see
+    /// by no venue evidence. <c>updateAccountTime</c> closes every ~3-minute account batch, changed or
+    /// not: it stamps <c>account-updates</c> (the channel's liveness evidence) and turns the account
+    /// values pushed since the last batch into the margin slot, so the buying-power reader gets IB's
+    /// own available funds instead of a one-times-leverage guess. Per-currency cash is not written here (see
     /// <c>docs/superpowers/specs/2026-08-28-binance-ibkr-position-writes-design.md</c> and
     /// <c>docs/superpowers/specs/2026-08-28-binance-ibkr-margin-slot-design.md</c>).</para>
     /// </summary>
@@ -41,7 +42,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
     {
         private const string BrokerTimeChannel = "broker-time";
         private const string PositionsSnapshotChannel = "positions-snapshot";
-        /// <summary>Stamped at every accountDownloadEnd (~3 min): the account channel is being served.</summary>
+        /// <summary>Stamped at every updateAccountTime (~3 min, sent changed or not): the account channel is being served.</summary>
         private const string AccountUpdatesChannel = "account-updates";
 
         // Standalone (not composed) IB runs are US-only in this fork; the composite overrides this.
@@ -74,7 +75,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             AccountValueKeys.MaintMarginReq
         };
 
-        // Filled by updateAccountValue and drained by accountDownloadEnd, both on the IB client
+        // Filled by updateAccountValue and read out by updateAccountTime, both on the IB client
         // thread and in order - same reason the sweep fields above take no lock. _marginCurrency is
         // the currency the accumulated rows are denominated in; see RecordAccountValue for why it is
         // not simply AccountBaseCurrency.
@@ -146,24 +147,40 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// <c>accountDownloadEnd</c>: the batch is complete. Stamps every registered market plus any
-        /// market that reported a position in this batch - a registered market with no positions
-        /// still needs the stamp, because that is exactly the case the reader has to read as flat.
+        /// <c>updateAccountTime</c>: IB closed an account-update batch. Stamps the account channel
+        /// alive under every registered market and writes the margin slot from the values that
+        /// have accumulated.
         /// </summary>
-        internal void StampPositionsSnapshot()
+        /// <remarks>
+        /// This is the one account message IB sends every batch (~180 s) whether or not anything
+        /// changed - <c>updateAccountValue</c> / <c>updatePortfolio</c> only carry changes (a flat
+        /// account pushes no portfolio rows at all), and <c>accountDownloadEnd</c> closes only a
+        /// full download, i.e. the initial subscription and reconnects; on a quiet day it arrives
+        /// twice. It also has no "lights out" hours, unlike <c>broker-time</c>, which
+        /// <c>HeartBeat()</c> withholds after 23:00 local and inside the gateway reset windows
+        /// while the account data keeps flowing. So the liveness stamp and the margin write both
+        /// hang here, once per batch: the margin slot's reader trusts it for 300 s, and a slot
+        /// rewritten only when a key changed would go stale on every quiet batch.
+        /// </remarks>
+        internal void OnAccountBatchDelivered()
         {
-            // The batch arriving at all is the liveness evidence for the account channel: IB
-            // pushes one every ~3 minutes for as long as the subscription is served, with no
-            // "lights out" hours - unlike broker-time, which HeartBeat() withholds after 23:00
-            // local and inside the gateway's reset windows while the account data keeps flowing
-            // (tradfi 2026-09-02: 2h13m/day of reconciliation judged UNVERIFIED on a healthy
-            // connection). Stamped BEFORE the completeness check on purpose: an incomplete sweep
-            // voids the position list, not the fact that the channel delivered.
             foreach (var market in _venueMarkets)
             {
                 BrokerageDataService.Instance.RecordChannelHeartbeat(market, AccountUpdatesChannel);
             }
 
+            WriteAccountMargin();
+        }
+
+        /// <summary>
+        /// <c>accountDownloadEnd</c>: the full download is complete. Stamps every registered market
+        /// plus any market that reported a position in this batch - a registered market with no
+        /// positions still needs the stamp, because that is exactly the case the reader has to
+        /// read as flat. Says nothing about channel liveness: this callback closes only the
+        /// initial download and the one after each reconnect (see <see cref="OnAccountBatchDelivered"/>).
+        /// </summary>
+        internal void StampPositionsSnapshot()
+        {
             if (_sweepIncomplete)
             {
                 Log.Error($"InteractiveBrokersBrokerage.StampPositionsSnapshot(): batch incomplete, not stamping {PositionsSnapshotChannel}.");
@@ -237,7 +254,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// <c>accountDownloadEnd</c>: writes the accumulated account values into the data plane's
+        /// <c>updateAccountTime</c>: writes the accumulated account values into the data plane's
         /// margin slot, once per registered market. Needs both <c>NetLiquidation</c> and
         /// <c>AvailableFunds</c> - equity without available margin is not a slot the buying-power
         /// reader can use, and a partial one written anyway would look exactly like a complete one.

@@ -1834,10 +1834,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 // set up event handlers
                 _client.UpdatePortfolio += HandlePortfolioUpdates;
-                // Resident, not just for the duration of DownloadAccount: the stamp is laid at the end
-                // of each full download - the initial one and every re-subscription or reconnect after
-                // it - while the rows themselves stay fresh from the streamed updatePortfolio pushes.
+                // Resident, not just for the duration of DownloadAccount: the positions stamp is laid
+                // at the end of each full download - the initial one and every re-subscription or
+                // reconnect after it - while the rows themselves stay fresh from the streamed
+                // updatePortfolio pushes.
                 _client.AccountDownloadEnd += HandleAccountDownloadEnd;
+                // Every account batch (~3 min) ends with updateAccountTime, changed or not; that is the
+                // liveness evidence for the account channel and the boundary the margin slot is
+                // written on. See HandleUpdateAccountTime.
+                _client.UpdateAccountTime += HandleUpdateAccountTime;
                 _client.OrderStatus += HandleOrderStatusUpdates;
                 _client.OpenOrder += HandleOpenOrder;
                 _client.OpenOrderEnd += HandleOpenOrderEnd;
@@ -3521,14 +3526,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// IB finished pushing a full portfolio batch: everything it holds has been written, so the
-        /// snapshot can be endorsed - unless a row of this batch failed to convert. The account
-        /// values that arrived with the same batch become the margin slot on the same boundary.
+        /// IB finished pushing a full portfolio download: everything it holds has been written, so the
+        /// snapshot can be endorsed - unless a row of this batch failed to convert. Fires only on the
+        /// initial subscription and after a reconnect, so nothing time-sensitive hangs off it.
         /// </summary>
         private void HandleAccountDownloadEnd(object sender, IB.AccountDownloadEndEventArgs e)
         {
             StampPositionsSnapshot();
-            WriteAccountMargin();
+        }
+
+        /// <summary>
+        /// IB closed an account-update batch (every ~3 minutes, pushed even when nothing changed).
+        /// The account channel is proven alive, and whatever account values arrived with this batch
+        /// become the margin slot.
+        /// </summary>
+        private void HandleUpdateAccountTime(object sender, IB.UpdateAccountTimeEventArgs e)
+        {
+            OnAccountBatchDelivered();
         }
 
         /// <summary>
