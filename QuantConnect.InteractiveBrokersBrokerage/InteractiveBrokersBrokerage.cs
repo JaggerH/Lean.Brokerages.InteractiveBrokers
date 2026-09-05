@@ -189,6 +189,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private readonly object _sync = new object();
 
+        /// <summary>
+        /// Throttles the 10197 "no market data during competing live session" warning: the gateway
+        /// repeats it for every subscription every 30 seconds while the condition lasts.
+        /// </summary>
+        private IB.CompetingLiveSessionMarketDataErrorHandler _competingSessionErrorHandler;
+        private IB.CompetingLiveSessionMarketDataErrorHandler CompetingSessionErrorHandler =>
+            LazyInitializer.EnsureInitialized(ref _competingSessionErrorHandler, () => new IB.CompetingLiveSessionMarketDataErrorHandler(OnMessage));
+
+        /// <summary>
+        /// Resubscribes once after a 1102 that turns out to have dropped the subscriptions.
+        /// See <see cref="PostReconnectSubscriptionWatchdog"/>. Lazy so the parameterless
+        /// (Composer / test) construction pays nothing.
+        /// </summary>
+        private PostReconnectSubscriptionWatchdog _reconnectWatchdog;
+        internal PostReconnectSubscriptionWatchdog ReconnectWatchdog =>
+            LazyInitializer.EnsureInitialized(ref _reconnectWatchdog,
+                () => new PostReconnectSubscriptionWatchdog(_reconnectSilenceTimeout, () => _subscribedSymbols.Keys, RestoreDataSubscriptions));
+
+        /// <summary>
+        /// Silence after a 1102 before the watchdog resubscribes. <c>ib-reconnect-silence-timeout</c>, seconds.
+        /// </summary>
+        private static readonly TimeSpan _reconnectSilenceTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-reconnect-silence-timeout", (int)PostReconnectSubscriptionWatchdog.DefaultSilenceTimeout.TotalSeconds));
+
         private readonly ConcurrentDictionary<string, ContractDetails> _contractDetails = new ConcurrentDictionary<string, ContractDetails>();
 
         private InteractiveBrokersSymbolMapper _symbolMapper;
@@ -1706,6 +1729,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             _aggregator.DisposeSafely();
+            _reconnectWatchdog?.Dispose();
             _ibAutomater?.Stop();
             _ibAutomater.DisposeSafely();
 
@@ -2354,7 +2378,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Handles error messages from IB
         /// </summary>
-        private void HandleError(object sender, IB.ErrorEventArgs e)
+        internal void HandleError(object sender, IB.ErrorEventArgs e)
         {
             // handles the 'connection refused' connect cases
             _connectEvent.Set();
@@ -2408,6 +2432,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             if (errorCode == 1100)
             {
                 StopGatewayRestartTask();
+                // a new outage supersedes any pending post-1102 silence check; the 1101/1102 that
+                // ends this outage decides again
+                ReconnectWatchdog.Disarm();
                 if (!_stateManager.Disconnected1100Fired)
                 {
                     _stateManager.Disconnected1100Fired = true;
@@ -2429,6 +2456,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 OnMessage(BrokerageMessageEvent.Reconnected(errorMsg));
 
                 _stateManager.Disconnected1100Fired = false;
+
+                // "data maintained" is not always true: a gateway that re-logged under a competing
+                // session desubscribes all farm market data yet reports 1102. Trust it, but verify -
+                // if nothing ticks for a while, resubscribe once.
+                ReconnectWatchdog.OnReconnectedDataMaintained(DateTime.UtcNow);
                 return;
             }
             else if (errorCode == 1101)
@@ -2440,6 +2472,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 RestoreDataSubscriptions();
                 return;
+            }
+            else if (errorCode == 2108)
+            {
+                // farm "inactive but should be available upon demand" = no active request on it.
+                // Right after a 1102 that is the earliest sign the subscriptions were dropped.
+                ReconnectWatchdog.OnFarmInactive(DateTime.UtcNow);
+            }
+            else if (errorCode == IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode)
+            {
+                // 10197 repeats per subscription every 30s; surface one warning per throttle window
+                CompetingSessionErrorHandler.Handle(DateTime.UtcNow, errorCode,
+                    errorMsg + ". Competing live session: paper market data is bound to the live username, which is logged in elsewhere (Client Portal, mobile app, TWS); no ticks arrive until that session ends");
             }
             else if (errorCode == 506)
             {
@@ -2560,6 +2604,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private void RestoreDataSubscriptions()
         {
+            // whoever restores (1101, a full connect, the watchdog itself) settles any pending 1102 check
+            ReconnectWatchdog.Disarm();
+
+            if (_subscriptionManager == null)
+            {
+                // never initialized (Composer / test construction): nothing was ever requested
+                return;
+            }
+
             List<Symbol> subscribedSymbols;
             lock (_sync)
             {
@@ -5072,7 +5125,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return securityExchangeHours;
         }
 
-        private void HandleTickPrice(object sender, IB.TickPriceEventArgs e)
+        internal void HandleTickPrice(object sender, IB.TickPriceEventArgs e)
         {
             // tickPrice events are always followed by tickSize events,
             // so we save off the bid/ask/last prices and only emit ticks in the tickSize event handler.
@@ -5158,9 +5211,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 default:
                     return;
             }
+
+            // A price message is proof the farm still serves this symbol, whether or not the
+            // matching size message later passes Tick.IsValid() (a quote whose size never
+            // validates is emitted nowhere, yet the feed is alive). Stamp liveness here so every
+            // subscribed symbol - not only the ones whose sizes validate - shows up in the feed
+            // registry; the stamp is a last-seen timestamp, so a second stamp from the size path
+            // moments later refreshes it rather than counting anything twice.
+            var utcNow = DateTime.UtcNow;
+            ReconnectWatchdog.RecordTick(symbol, utcNow);
+            RecordFeedMessage(symbol);
         }
 
-        private void HandleTickSize(object sender, IB.TickSizeEventArgs e)
+        internal void HandleTickSize(object sender, IB.TickSizeEventArgs e)
         {
             SubscriptionEntry entry;
             if (!_subscribedTickers.TryGetValue(e.TickerId, out entry))
@@ -5305,9 +5368,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // Feed liveness for the adjudicator's G4. Without this the equity leg never appears
                 // in market_data_feeds and "not listed" is indistinguishable from "alive". IB has
                 // no keepalive - a quiet symbol simply sends nothing - so the silence threshold
-                // for this venue is a property of the symbol, not of the socket.
+                // for this venue is a property of the symbol, not of the socket. Size-only
+                // updates arrive without a price message, so this stamp is not redundant with
+                // the one in HandleTickPrice.
+                ReconnectWatchdog.RecordTick(symbol, DateTime.UtcNow);
                 RecordFeedMessage(symbol);
             }
+        }
+
+        /// <summary>
+        /// Registers a ticker id → symbol mapping without a gateway, so tests can drive the tick
+        /// handlers. Production subscriptions go through <see cref="Subscribe(IEnumerable{Symbol})"/>.
+        /// </summary>
+        internal void RegisterSubscriptionForTesting(int tickerId, Symbol symbol)
+        {
+            _subscribedSymbols[symbol] = tickerId;
+            _subscribedTickers[tickerId] = new SubscriptionEntry { Symbol = symbol, PriceMagnifier = 1 };
         }
 
         /// <summary>
@@ -6567,7 +6643,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // 'Request Account Data Sending Error' can happen while connecting sometimes let's ignore it else it bubbles up to the user even if we connected successfully later
             542,
             10148, // we are going to handle it as an order event
-            1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2157, 2158, 10197
+            1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2157, 2158,
+            // surfaced as a throttled Warning by CompetingLiveSessionMarketDataErrorHandler, not raw
+            IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode
         };
 
         // the default delay for IBAutomater restart
