@@ -6005,6 +6005,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     OnMessage(new BrokerageMessageEvent(BrokerageMessageType.ActionRequired, "2FAAuthRequired", message));
                 });
             }
+            else if (e.Data.StartsWith("Login failed", StringComparison.InvariantCultureIgnoreCase))
+            {
+                // A login rejection during the run (the gateway re-logs in after a 1100 connectivity
+                // loss) only ever reached this trace line. The gateway then sits on the rejected
+                // dialog doing nothing until its own scheduled daily restart, which is when
+                // IBAutomater finally reports InitializationTimeout - measured 2026-09-07 and
+                // 2026-09-10: rejected at 21:07Z, dead until the 23:45Z restart. Raise it as an
+                // Error with the same code IBAutomater uses for a rejected initial login, so the
+                // handler above the brokerage can decide to end the run instead of waiting.
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "LoginFailed", e.Data));
+            }
 
             Log.Trace($"InteractiveBrokersBrokerage.OnIbAutomaterOutputDataReceived(): {e.Data}");
         }
